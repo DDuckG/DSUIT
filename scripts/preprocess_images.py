@@ -1,7 +1,8 @@
 import os, argparse, numpy as np
 import cv2
 
-def gray_world_wb(img): #while balance
+#while balance
+def gray_world_wb(img):
     b, g, r = cv2.split(img)
     mb = np.mean(b)
     mg = np.mean(g)
@@ -15,14 +16,15 @@ def gray_world_wb(img): #while balance
     r = np.clip(r * kr, 0, 255)
     return cv2.merge([b, g, r])
 
-def apply_clahe_bgr(img, clip=2.0, tile=8): #contrast limited adaptive histogram equalization
+#contrast limited adaptive histogram equalization
+def apply_clahe_bgr(img, clip=2.0, tile=8):
     lab = cv2.cvtColor(img.astype('uint8'), cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tile, tile))
-    l2 = clahe.apply(l)
-    lab2 = cv2.merge([l2, a, b])
-    bgr2 = cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
-    return bgr2
+    clahe = cv2.createCLAHE(clipLimit = clip, tileGridSize = (tile, tile))
+    L = clahe.apply(l)
+    Lab = cv2.merge([L, a, b])
+    bgr = cv2.cvtColor(Lab, cv2.COLOR_LAB2BGR)
+    return bgr
 
 def main():
     parser = argparse.ArgumentParser()
@@ -31,26 +33,26 @@ def main():
     parser.add_argument('--clahe_clip', type=float, default=2.0)
     parser.add_argument('--clahe_tile', type=int, default=8)
     parser.add_argument('--overwrite', action='store_true')
-    args = parser.parse_args()
+    arguments = parser.parse_args()
 
-    src = args.src
-    out = args.out
-    os.makedirs(out, exist_ok=True)
+    source = arguments.source
+    output = arguments.output
+    os.makedirs(output, exist_ok=True)
 
-    files = sorted([f for f in os.listdir(src) if f.lower().endswith('.jpg')])
-    for fn in files:
-        srcp = os.path.join(src, fn)
-        outp = os.path.join(out, fn)
-        if os.path.exists(outp) and not args.overwrite:
+    files = sorted([file for file in os.listdir(source) if file.lower().endswith('.jpg')])
+    for file in files:
+        source_path = os.path.join(source, file)
+        output_path = os.path.join(output, file)
+        if os.path.exists(output_path) and not arguments.overwrite:
             continue
-        img = cv2.imread(srcp, cv2.IMREAD_COLOR)
+        img = cv2.imread(source_path, cv2.IMREAD_COLOR)
         if img is None:
-            print('ERR load', srcp)
+            print('[ERROR] while loading:', source_path)
             continue
         img = img.astype('float32')
         img = gray_world_wb(img)
-        img = apply_clahe_bgr(img, clip=args.clahe_clip, tile=args.clahe_tile)
-        cv2.imwrite(outp, img.astype('uint8'))
+        img = apply_clahe_bgr(img, clip = arguments.clahe_clip, tile = arguments.clahe_tile)
+        cv2.imwrite(output_path, img.astype('uint8'))
     print('Processed', len(files), 'images')
 
 if __name__ == '__main__':

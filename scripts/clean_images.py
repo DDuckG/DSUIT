@@ -48,8 +48,8 @@ def average_hash(gray, hash_size = 8):
     pxl = met.flatten().astype(np.uint8)
     avg = pxl.mean()
     bit = (pxl > avg).astype(np.uint8)
-    bit_str = ''.join(bit.astype('str'))
-    return bit_str
+    string_bit = ''.join(bit.astype('str'))
+    return string_bit
 
 def hamming_diff(s1, s2):
     if s1 is None or s2 is None:
@@ -61,19 +61,19 @@ def hamming_diff(s1, s2):
     return diff
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument('--src', required = True, help = 'Source directory')
-    p.add_argument('--out', required = True, help = 'Output directory for cleaned images')
-    p.add_argument('--plot_hist', action='store_true', help = 'Save histogram')
-    p.add_argument('--min_bright_pct', type = float, default = 10)
-    p.add_argument('--min_tenengrad_scr', type = float, default = 80)
-    p.add_argument('--min_norm_laplacian', type = float, default = 30)
-    p.add_argument('--hash_size', type = int, default = 8)
-    p.add_argument('--hamming_threshold', type = float, default = 5)
-    p.add_argument('--min_mean_brightness', type = float, default=30.0)
-    p.add_argument('--max_mean_brightness', type = float, default=230.0)
-    p.add_argument('--verbose', action = 'store_true', help = 'Print action per file')
-    arguments = p.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--src', required = True, help = 'Source directory')
+    parser.add_argument('--out', required = True, help = 'Output directory for cleaned images')
+    parser.add_argument('--plot_hist', action='store_true', help = 'Save histogram')
+    parser.add_argument('--verbose', action = 'store_true', help = 'Print action per file')
+    parser.add_argument('--min_bright_pct', type = float, default = 10)
+    parser.add_argument('--min_tenengrad_scr', type = float, default = 80)
+    parser.add_argument('--min_norm_laplacian', type = float, default = 30)
+    parser.add_argument('--hash_size', type = int, default = 8)
+    parser.add_argument('--hamming_threshold', type = float, default = 5)
+    parser.add_argument('--min_mean_brightness', type = float, default=30.0)
+    parser.add_argument('--max_mean_brightness', type = float, default=230.0)
+    arguments = parser.parse_args()
 
     source = Path(arguments.src)
     output = Path(arguments.out)
@@ -84,9 +84,9 @@ def main():
     reject.mkdir(parents = True, exist_ok = True)
     low_light.mkdir(parents = True, exist_ok = True)
 
-    files = sorted([f for f in os.listdir(source) if f.lower().endswith('.jpg')])
+    files = sorted([file for file in os.listdir(source) if file.lower().endswith('.jpg')])
     if not files:
-        print(f'No images files in {source}')
+        print(f"No images files in {source}")
         return
 
     hashes = []
@@ -188,34 +188,26 @@ def main():
                 if not is_dupe:
                     hashes.append(aHash)
                     dupe_distance = str(min_diff) if min_diff is not None else ''
-                    try:
-                        shutil.copy2(str(path), str(output / file))
-                        keep_count += 1
-                        status = 'keep'
-                        report.append({'filename': file, 
-                                       'var_raw': f"{var:.5f}", 
-                                       'mean_raw': f"{mean:.5f}", 
-                                       'pct10_raw': f"{pct10:.5f}", 
-                                       'tenengrad_raw': f"{tenengrad_scr:.5f}", 
-                                       'norm_laplacian_raw': f"{norm_laplacian:.5f}", 
-                                       'status': status, 
-                                       'reason': '', 
-                                       'dupe_distance': dupe_distance})
-                        if arguments.verbose:
-                            print('[KEEP]', file, f"normLaplacian = {norm_laplacian:.1f})", f"mean = {mean:.1f}")
-                        continue
-                    except Exception as error:
-                        reason = f'copy_error: {error}'
+                    shutil.copy2(str(path), str(output / file))
+                    keep_count += 1
+                    status = 'keep'
+                    report.append({'filename': file, 
+                                    'var_raw': f"{var:.5f}", 
+                                    'mean_raw': f"{mean:.5f}", 
+                                    'pct10_raw': f"{pct10:.5f}", 
+                                    'tenengrad_raw': f"{tenengrad_scr:.5f}", 
+                                    'norm_laplacian_raw': f"{norm_laplacian:.5f}", 
+                                    'status': status, 
+                                    'reason': '', 
+                                    'dupe_distance': dupe_distance})
+                    if arguments.verbose:
+                        print('[KEEP]', file, f"normLaplacian = {norm_laplacian:.1f})", f"mean = {mean:.1f}")
+                    continue
 
             reject_count += 1
-            try:
-                shutil.move(str(path), str(reject / file))
-            except Exception:
-                try:
-                    shutil.copy2(str(path), str(reject / file))
-                    os.remove(str(path))
-                except Exception:
-                    pass
+            shutil.move(str(path), str(reject / file))
+            shutil.copy2(str(path), str(reject / file))
+            os.remove(str(path))
             if arguments.verbose:
                 print('[REJECT]', file, reason) 
             report.append({'filename': file, 
@@ -233,10 +225,7 @@ def main():
             if arguments.verbose:
                 print(f"[ERROR] processing {file}: {error}\n{traceb}")
             reject_count += 1
-            try:
-                shutil.move(str(path), str(reject / file))
-            except Exception:
-                pass
+            shutil.move(str(path), str(reject / file))
             report.append({'filename': file, 
                            'var_raw': '',
                            'mean_raw': '',
@@ -255,17 +244,29 @@ def main():
         header = ['filename', 'status', 'var_raw', 'mean_raw', 'pct10_raw', 'tenengrad_raw', 'norm_laplacian_raw', 'reason', 'dupe_distance']
         w.writerow(header)
         for r in report:
-            w.writerow([r.get('filename',''), r.get('status',''), r.get('var_raw',''), r.get('mean_raw',''),
-                        r.get('pct10_raw',''), r.get('tenengrad_raw',''), r.get('norm_laplacian_raw',''), r.get('reason',''), r.get('dupe_distance','')])
+            w.writerow([r.get('filename',''),
+                        r.get('status',''),
+                        r.get('var_raw',''),
+                        r.get('mean_raw',''),
+                        r.get('pct10_raw',''),
+                        r.get('tenengrad_raw',''),
+                        r.get('norm_laplacian_raw',''),
+                        r.get('reason',''),
+                        r.get('dupe_distance','')])
 
     with open(hist_file, 'w', newline='', encoding='utf-8') as hf:
         w = csv.writer(hf)
         w.writerow(['filename', 'var_raw', 'mean_raw', 'pct10_raw', 'tenengrad_raw', 'norm_laplacian_raw', 'status'])
         for r in report:
-            w.writerow([r.get('filename',''), r.get('var_raw',''), r.get('mean_raw',''), r.get('pct10_raw',''),
-                        r.get('tenengrad_raw',''), r.get('norm_laplacian_raw',''), r.get('status','')])
+            w.writerow([r.get('filename',''),
+                        r.get('var_raw',''),
+                        r.get('mean_raw',''),
+                        r.get('pct10_raw',''),
+                        r.get('tenengrad_raw',''),
+                        r.get('norm_laplacian_raw',''),
+                        r.get('status','')])
     
-    print(f"Done. Kept={keep_count}, Kept_low_light={low_light_count}, Rejected={reject_count}. Report saved to {report_file}")
+    print(f"Done. Kept = {keep_count}, Kept_low_light = {low_light_count}, Rejected = {reject_count}.")
 
     if arguments.plot_hist:
         try:
@@ -289,46 +290,45 @@ def main():
                 except Exception:
                     pass
 
-            if var_list:
-                plt.figure()
-                plt.hist(var_list, bins = 50)
-                plt.title('Raw Laplacian variance distribution')
-                plt.xlabel('variance')
-                plt.ylabel('count')
-                plt.savefig(str(output.parent / 'var_hist.png'))
-                plt.close()
-            if mean_list:
-                plt.figure()
-                plt.hist(mean_list, bins = 50)
-                plt.title('Raw mean brightness distribution')
-                plt.xlabel('mean brightness')
-                plt.ylabel('count')
-                plt.savefig(str(output.parent / 'mean_hist.png'))
-                plt.close()
-            if pct10_list:
-                plt.figure()
-                plt.hist(pct10_list, bins = 50)
-                plt.title('10th percentile brightness distribution (p10)')
-                plt.xlabel('p10')
-                plt.ylabel('count')
-                plt.savefig(str(output.parent / 'pct10_hist.png'))
-                plt.close()
-            if tenengrad_list:
-                plt.figure()
-                plt.hist(tenengrad_list, bins = 50)
-                plt.title('Tenengrad distribution')
-                plt.xlabel('tenengrad')
-                plt.ylabel('count')
-                plt.savefig(str(output.parent / 'tenengrad_hist.png'))
-                plt.close()
-            if normLaplacian_list:
-                plt.figure()
-                plt.hist(normLaplacian_list, bins = 50)
-                plt.title('Normalized Laplacian distribution')
-                plt.xlabel('norm_laplacian')
-                plt.ylabel('count')
-                plt.savefig(str(output.parent / 'normlaplacian_hist.png'))
-                plt.close()
+            plt.figure()
+            plt.hist(var_list, bins = 50)
+            plt.title('Raw Laplacian variance distribution')
+            plt.xlabel('variance')
+            plt.ylabel('count')
+            plt.savefig(str(output.parent / 'var_hist.png'))
+            plt.close()
+
+            plt.figure()
+            plt.hist(mean_list, bins = 50)
+            plt.title('Raw mean brightness distribution')
+            plt.xlabel('mean brightness')
+            plt.ylabel('count')
+            plt.savefig(str(output.parent / 'mean_hist.png'))
+            plt.close()
+
+            plt.figure()
+            plt.hist(pct10_list, bins = 50)
+            plt.title('10th percentile brightness distribution (p10)')
+            plt.xlabel('p10')
+            plt.ylabel('count')
+            plt.savefig(str(output.parent / 'pct10_hist.png'))
+            plt.close()
+
+            plt.figure()
+            plt.hist(tenengrad_list, bins = 50)
+            plt.title('Tenengrad distribution')
+            plt.xlabel('tenengrad')
+            plt.ylabel('count')
+            plt.savefig(str(output.parent / 'tenengrad_hist.png'))
+            plt.close()
+
+            plt.figure()
+            plt.hist(normLaplacian_list, bins = 50)
+            plt.title('Normalized Laplacian distribution')
+            plt.xlabel('norm_laplacian')
+            plt.ylabel('count')
+            plt.savefig(str(output.parent / 'normlaplacian_hist.png'))
+            plt.close()
 
         except Exception as error:
             print("[ERROR] while plotting hist: ", error)
