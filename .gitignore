@@ -1,0 +1,4 @@
+data/clean_videos/*
+data/raw_videos/*
+**/__pycache__/
+outputs
