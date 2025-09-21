@@ -21,7 +21,7 @@ if __name__ == '__main__':
     parser.add_argument('--visual', action = 'store_true')
     argument = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     model_configs = {
         'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
@@ -42,7 +42,7 @@ if __name__ == '__main__':
     PLY_SKIP = 1 # (1 = mọi frame, 5 = 1 của 5 frame, ...)
     # process chunks, lưu depth per-frame
     depth_npz_paths = []
-    for i in range(0, len(frames), CHUNK):
+    for i in range(1, len(frames) + 1, CHUNK):
         chunk_frames = frames[i:i + CHUNK]
         print(f"Processing chunk frames {i}..{i + len(chunk_frames) - 1}")
         depths_chunk, _ = vdanything.infer_video_depth(chunk_frames, fps, input_size = argument.input_size, device = device, fp32 = True)
@@ -56,6 +56,18 @@ if __name__ == '__main__':
         del depths_chunk
         torch.cuda.empty_cache()
         gc.collect()
+    
+    expected_frames = int(cv2.VideoCapture(argument.src).get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if len(depth_npz_paths) < expected_frames:
+        # copy frame cuối
+        last_path = depth_npz_paths[-1]
+        last_id = int(os.path.basename(last_path).split("_")[1].split(".")[0])
+        for id in range(last_id+1, expected_frames+1):
+            dup_path = os.path.join(argument.out, f"depth_{id:05d}.npz")
+            os.system(f"cp {last_path} {dup_path}")
+            depth_npz_paths.append(dup_path)
+        print(f"[INFO] Duplicated last depth to fill missing {expected_frames - len(depth_npz_paths)} frames")
 
     if argument.visual:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')

@@ -13,3 +13,4 @@ scipy>=1.10
 tqdm>=4.65
 imageio
 xformers
+pycocotools

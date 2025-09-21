@@ -1,7 +1,7 @@
 import torch
 from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 MODEL_ID = "nvidia/segformer-b1-finetuned-ade-512-512"
 
