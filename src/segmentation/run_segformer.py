@@ -73,7 +73,7 @@ def process_video(src, out, skip_frames = 1, visual = False):
     angle = get_video_rotation(src)
     cap = cv2.VideoCapture(src)
     writer = None
-    id = 0
+    id = 1
 
     if visual:
         vis_path = out / (Path(src).stem + ".mp4")
