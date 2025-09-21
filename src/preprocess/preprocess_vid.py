@@ -22,6 +22,9 @@ def adjust_white_balance(frame):
     return result
 
 def enhance_contrast(frame):
+    if len(frame.shape) == 2 or (len(frame.shape) == 3 and frame.shape[2] == 1):
+        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit = 2.0, tileGridSize = (8, 8))
