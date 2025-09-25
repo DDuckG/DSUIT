@@ -90,6 +90,10 @@ src:
   segformer:
     model: "checkpoints/segformer_b5.pth"
     input_size: [512, 512]          # resize input
+  bisenet:
+    model: "models/bisenet_v2/bisenetv2_cityscapes.pth"
+    input_size: [1024, 512]
+    obstacle_classes: [4,5,8] # indices example -> fence, pole, vegetation
   depth:
     model: "checkpoints/video_depth_anything_vits.pth"
     encoder: "vits"
