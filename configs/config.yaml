@@ -1,14 +1,22 @@
-global:
-  device: "cuda"
-  output_dir: "outputs"
+io:
+  output_fps: 7
+  output_size: [640, 360]
+  reader_backend: "opencv"            # ổn định hơn khi chạy stream + ít phụ thuộc
 
-src:
+camera:
+  height_m: 1.35
+  fov_deg_h: 73.0
+  principal: [0.5, 0.5]
+
+models:
   yolo:
-    model: "yolov12/yolov12m.pt" # đường dẫn mặc định YOLO
-    conf_threshold: 0.3
-    whitelist_classes:              # chỉ detect những class này
+    weights: "models/yolov12/yolov12m.pt"   # 3050 4GB: bản n nhanh hơn; có thể đổi sang m nếu đủ VRAM
+    conf: 0.40
+    iou: 0.60
+    half: true
+    whitelist_classes:
       - 0    # person
-      - 1    # bicycle  
+      - 1    # bicycle
       - 2    # car
       - 3    # motorcycle
       # - 4    # airplane
@@ -19,50 +27,50 @@ src:
       - 9    # traffic light
       - 10   # fire hydrant
       - 11   # stop sign
-      # - 12   # parking meter
+      # - 12  # parking meter
       - 13   # bench
-      # - 14   # bird
-      # - 15   # cat
-      # - 16   # dog
-      # - 17   # horse
-      # - 18   # sheep
-      # - 19   # cow
-      # - 20   # elephant
-      # - 21   # bear
-      # - 22   # zebra
-      # - 23   # giraffe
-      # - 24   # backpack
-      # - 25   # umbrella
-      # - 26   # handbag
-      # - 27   # tie
-      # - 28   # suitcase
-      # - 29   # frisbee
-      # - 30   # skis
-      # - 31   # snowboard
-      # - 32   # sports ball
-      # - 33   # kite
-      # - 34   # baseball bat
-      # - 35   # baseball glove
-      # - 36   # skateboard
-      # - 37   # surfboard
+      # - 14  # bird
+      # - 15  # cat
+      # - 16  # dog
+      # - 17  # horse
+      # - 18  # sheep
+      # - 19  # cow
+      # - 20  # elephant
+      # - 21  # bear
+      # - 22  # zebra
+      # - 23  # giraffe
+      - 24   # backpack
+      - 25   # umbrella
+      - 26   # handbag
+      - 27   # tie
+      - 28   # suitcase
+      - 29   # frisbee
+      - 30   # skis
+      - 31   # snowboard
+      - 32   # sports ball
+      - 33   # kite
+      - 34   # baseball bat
+      - 35   # baseball glove
+      - 36   # skateboard
+      - 37   # surfboard
       - 38   # tennis racket
-      # - 39   # bottle
-      # - 40   # wine glass
-      # - 41   # cup
-      # - 42   # fork
-      # - 43   # knife
-      # - 44   # spoon
-      # - 45   # bowl
-      # - 46   # banana
-      # - 47   # apple
-      # - 48   # sandwich
-      # - 49   # orange
-      # - 50   # broccoli
-      # - 51   # carrot
-      # - 52   # hot dog
-      # - 53   # pizza
-      # - 54   # donut
-      # - 55   # cake
+      - 39   # bottle
+      - 40   # wine glass
+      - 41   # cup
+      - 42   # fork
+      - 43   # knife
+      - 44   # spoon
+      - 45   # bowl
+      - 46   # banana
+      - 47   # apple
+      - 48   # sandwich
+      - 49   # orange
+      - 50   # broccoli
+      - 51   # carrot
+      - 52   # hot dog
+      - 53   # pizza
+      - 54   # donut
+      - 55   # cake
       - 56   # chair
       - 57   # couch
       - 58   # potted plant
@@ -71,8 +79,8 @@ src:
       - 61   # toilet
       - 62   # tv
       - 63   # laptop
-      # - 64   # mouse
-      # - 65   # remote
+      # - 64  # mouse
+      # - 65  # remote
       - 66   # keyboard
       - 67   # cell phone
       - 68   # microwave
@@ -87,29 +95,49 @@ src:
       - 77   # teddy bear
       - 78   # hair drier
       - 79   # toothbrush
-  segformer:
-    model: "checkpoints/segformer_b5.pth"
-    input_size: [512, 512]          # resize input
-  bisenet:
-    model: "models/bisenet_v2/bisenetv2_cityscapes.pth"
-    input_size: [1024, 512]
-    obstacle_classes: [4,5,8] # indices example -> fence, pole, vegetation
-  depth:
-    model: "checkpoints/video_depth_anything_vits.pth"
-    encoder: "vits"
-    input_size: [518, 518]
-  fusion:
-    enable_tracking: true
-    tracker: "ocsort"
-    save_meta: true
-    meta_file: "id_to_meta.json"
-    alerts_file: "alerts.csv"
 
-postprocess:
-  visualization:
-    draw_bbox: true
-    draw_depth: true
-    draw_segmentation: true
-    font_scale: 0.5
-    thickness: 2
-    output_video: "outputs/visualized.mp4"
+  segmentation:
+    weights: "models/bisenet_v2/weights/bisenetv2_cityscapes.pth"
+    half: true
+    run_every_k: 3
+  depth:
+    encoder: "vits"
+    checkpoint: "models/video_depth_anything/checkpoints/video_depth_anything_vits.pth"
+    input_size: 518
+    stream: true
+    fp32: false
+    xformers: true
+
+tracking:
+  type: "ocsort"
+  max_age: 30
+  iou: 0.3
+
+fusion:
+  distance_thresholds_m: [1.8, 3.5]    # màu: đỏ <1.8; vàng 1.8–3.5; xanh >3.5
+
+  plane_fit:
+    method: "ransac"                   # robust hơn LS
+    inlier_thr_m: 0.05                 # 5 cm
+    max_iter: 150
+    sample_stride: 4
+    ema_beta: 0.9
+    use_sidewalk: true
+    use_terrain: true
+
+  obstacle:                             # obstacle chung cho toàn khung (không phụ thuộc YOLO)
+    height_min_m: 0.30                 # cao hơn mặt phẳng ≥ 30 cm
+    foot_height_m: 0.06                # vùng “chân” để đo khoảng cách
+    depth_min_m: 0.40
+    depth_max_m: 10.0                  # bỏ xa hơn 10 m
+    downsample: 0.5                    # xử lý CC ở ảnh nhỏ hơn
+    area_min_m2: 0.03                  # lọc vật cực nhỏ
+    iou_merge_yolo: 0.50               # ghép obstacle ↔ YOLO nếu IoU đủ lớn
+    nms_iou: 0.55
+    topk: 15                           # hiển thị nhiều nhất K vật gần nhất
+    persistence_min: 2                 # chỉ vẽ nếu tồn tại ≥2 khung (giảm rác)
+
+viz:
+  thickness: 2
+  font_scale: 0.5
+  show_fps: true
