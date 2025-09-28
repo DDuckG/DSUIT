@@ -9,37 +9,58 @@ sys.path.append(os.path.abspath("."))
 from src.config import load_config
 from src.io.video_reader import VideoReader
 from src.io.video_writer import VideoWriter
-from src.viz.drawer import draw_boxes
+from src.viz.drawer import draw_boxes, draw_hud
 from src.perception.detector_yolo import YOLODetector
 from src.perception.segment_bisenet import BiSeNetSeg
 from src.perception.depth_vda import DepthStreamVDA
 from src.tracking.ocsort import OCSort
 from src.fusion.ground_plane import GroundPlaneScaler
-from src.fusion.depth_utils import roi_bottom, robust_depth_stat
-from src.fusion.obstacle_general import detect_obstacles_by_height
+from src.fusion.depth_enhance import DepthEnhancer
+from src.fusion.depth_utils import depth_from_yolo_box, depth_from_obs_box
 from src.fusion.fuser import merge_yolo_obstacle, nms_iou
-
-def _iou_with_all(a, arr):
-    if len(arr) == 0: return np.array([])
-    a = np.array(a, dtype=float); arr = np.array(arr, dtype=float)
-    x1 = np.maximum(a[0], arr[:,0])
-    y1 = np.maximum(a[1], arr[:,1])
-    x2 = np.minimum(a[2], arr[:,2])
-    y2 = np.minimum(a[3], arr[:,3])
-    inter = np.maximum(0.0, x2-x1)*np.maximum(0.0, y2-y1)
-    ua = (a[2]-a[0])*(a[3]-a[1]) + (arr[:,2]-arr[:,0])*(arr[:,3]-arr[:,1]) - inter + 1e-9
-    return inter/ua
+from src.fusion.depth_edges import detect_obstacles_by_depth_edges
+from src.fusion.bev import BEVProjectorTorch, BEVConfig
 
 def _stable_persist_key(b):
-    """Khoá ổn định theo (cx, cy, w, h) lượng tử hoá → giảm rung."""
-    x1, y1, x2, y2 = [float(v) for v in b]
-    cx = (x1 + x2) * 0.5
-    cy = (y1 + y2) * 0.5
-    w  = (x2 - x1)
-    h  = (y2 - y1)
-    q = lambda v, s: round(v / s) * s
-    # lượng tử theo 4px → bền hơn giữa các khung
-    return (q(cx, 4.0), q(cy, 4.0), q(w, 4.0), q(h, 4.0))
+    x1,y1,x2,y2 = [float(v) for v in b]
+    cx=(x1+x2)*0.5; cy=(y1+y2)*0.5; w=(x2-x1); h=(y2-y1)
+    q=lambda v,s: round(v/s)*s
+    return (q(cx,4.0), q(cy,4.0), q(w,4.0), q(h,4.0))
+
+def _update_persistence(persist_map, boxes, dists, min_vote=3, decay=0.85, max_miss=8):
+    seen = set()
+    for i, b in enumerate(boxes):
+        k = _stable_persist_key(b)
+        st = persist_map.get(k, {"vote":0, "box":np.array(b, dtype=float), "z":float(dists[i]) if i<len(dists) else np.nan, "miss":0})
+        st["vote"] = min(10, st["vote"] + 1)
+        st["box"] = st["box"]*decay + np.array(b, dtype=float)*(1.0-decay)
+        if i < len(dists) and np.isfinite(dists[i]):
+            if not np.isfinite(st.get("z", np.nan)):
+                st["z"] = float(dists[i])
+            else:
+                st["z"] = st["z"]*decay + float(dists[i])*(1.0-decay)
+        st["miss"] = 0
+        persist_map[k] = st
+        seen.add(k)
+
+    to_del=[]
+    for k, st in persist_map.items():
+        if k not in seen:
+            st["miss"] = st.get("miss",0)+1
+            st["vote"] = max(0, st["vote"] - 1)
+            if st["miss"] > max_miss and st["vote"] == 0:
+                to_del.append(k)
+    for k in to_del:
+        persist_map.pop(k, None)
+
+    out_boxes=[]; out_dists=[]
+    for k, st in persist_map.items():
+        if st["vote"] >= min_vote and st["miss"] <= 1:
+            out_boxes.append(st["box"])
+            out_dists.append(st.get("z", np.nan))
+    if len(out_boxes)==0:
+        return np.zeros((0,4), dtype=float), np.zeros((0,), dtype=float)
+    return np.vstack(out_boxes).astype(float), np.asarray(out_dists, dtype=float)
 
 def process_video(src_path: str, out_path: str, cfg: dict):
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -51,154 +72,175 @@ def process_video(src_path: str, out_path: str, cfg: dict):
 
     # Models
     ycfg = cfg["models"]["yolo"]
-    det = YOLODetector(
-        ycfg["weights"], conf=ycfg["conf"], iou=ycfg["iou"], half=ycfg["half"],
-        whitelist=ycfg.get("whitelist_classes", None), device=device
-    )
+    det = YOLODetector(ycfg["weights"], conf=ycfg["conf"], iou=ycfg["iou"],
+                       half=ycfg["half"], whitelist=ycfg.get("whitelist_classes", None), device=device)
 
     scfg = cfg["models"]["segmentation"]
     seg_model = BiSeNetSeg(scfg["weights"], half=scfg["half"], device=device)
     run_seg_every = max(1, int(scfg["run_every_k"]))
 
     dcfg = cfg["models"]["depth"]
-    dep = DepthStreamVDA(
-        encoder=dcfg["encoder"], checkpoint=dcfg["checkpoint"],
-        input_size=dcfg["input_size"], device=device, fp32=dcfg["fp32"]
-    )
+    dep = DepthStreamVDA(encoder=dcfg["encoder"], checkpoint=dcfg["checkpoint"],
+                         input_size=dcfg["input_size"], device=device, fp32=dcfg["fp32"])
 
     # Fusion helpers
     pf = cfg["fusion"]["plane_fit"]
-    scaler = GroundPlaneScaler(
-        reader.W, reader.H, cfg["camera"]["fov_deg_h"], cfg["camera"]["principal"],
-        cam_h=cfg["camera"]["height_m"],
-        sample_stride=pf.get("sample_stride", 4),
-        ema_beta=pf.get("ema_beta", 0.9),
-        use_sidewalk=pf.get("use_sidewalk", True),
-        use_terrain=pf.get("use_terrain", True),
-        method=pf.get("method", "ransac"),
-        inlier_thr=pf.get("inlier_thr_m", 0.05),
-        max_iter=pf.get("max_iter", 150),
-    )
+    scaler = GroundPlaneScaler(reader.W, reader.H, cfg["camera"]["fov_deg_h"], cfg["camera"]["principal"],
+                               cam_h=cfg["camera"]["height_m"], sample_stride=pf.get("sample_stride",4),
+                               ema_beta=pf.get("ema_beta",0.9), use_sidewalk=pf.get("use_sidewalk",True),
+                               use_terrain=pf.get("use_terrain",True), method=pf.get("method","ransac"),
+                               inlier_thr=pf.get("inlier_thr_m",0.06), max_iter=pf.get("max_iter",150))
 
     thr_low, thr_high = cfg["fusion"]["distance_thresholds_m"]
-    ocfg = cfg["fusion"]["obstacle"]
+    ocfg  = cfg["fusion"]["obstacle"]
+    ecfg  = cfg["fusion"].get("edge_enhance", {})
+    eocfg = cfg["fusion"].get("edge_obstacle", {})
+    bev_cfg = cfg["fusion"].get("bev", {})
 
-    # Tracker (gán ID ổn định cho các box YOLO)
     tracker = OCSort(max_age=cfg["tracking"]["max_age"], iou_thr=cfg["tracking"]["iou"])
 
-    # stride để đạt output_fps
     stride = max(1, int(round(reader.fps / float(cfg["io"]["output_fps"]))))
     last_seg = None
     frame_id = 0
-    persist_map = {}      # key -> count
+    persist_obs = {}
+
+    # Lazy init: enhancer + BEV projector
+    if not hasattr(process_video, "_depth_enh"):
+        from src.fusion.depth_enhance import DepthEnhancer
+        process_video._depth_enh = DepthEnhancer(ecfg)
+    enh = process_video._depth_enh
+
+    bev_proj = None
 
     for packet in reader:
         frame_id += 1
         if (frame_id - 1) % stride != 0:
             continue
 
-        rgb = packet.rgb
+        rgb = packet.rgb  # RGB
         H, W = packet.H, packet.W
 
-        # 1) DEPTH
-        depth_rel = dep.infer_one(rgb)  # HxW float32
+        # 1) Depth tương đối
+        depth_rel = dep.infer_one(rgb).astype(np.float32)
 
-        # 2) SEG (thưa khung)
+        # 2) Seg (thưa khung)
         if (frame_id % run_seg_every) == 0 or last_seg is None:
-            seg_id = seg_model(rgb)
-            last_seg = seg_id
+            seg_id = seg_model(rgb); last_seg = seg_id
         else:
             seg_id = last_seg
 
-        # 3) Plane scale (EMA) -> metric depth
+        # 3) Ước lượng α, plane –> mét: Z = α / depth_rel
         alpha, plane = scaler.estimate_scale(depth_rel, seg_id)
-        depth_m = depth_rel * float(alpha)
+        depth_m = alpha / (np.maximum(depth_rel, 1e-6))
 
-        # 4) Obstacle từ height-map (toàn khung)
-        obs_boxes, obs_dists, obs_scores = detect_obstacles_by_height(
-            scaler, depth_m, plane, seg_id, ocfg
+        # 3b) Depth enhance (GPU trong DepthEnhancer)
+        depth_m_enh, sigma_m = enh(depth_m, rgb)
+
+        # 4) Height-map
+        height_m = scaler.height_from_plane(depth_m, plane)
+
+        # 5) BEV occupancy (bổ trợ, “thoáng tay”)
+        if bev_proj is None:
+            # build intrinsics (pixel principal point)
+            fx, fy, cx, cy = scaler.fx, scaler.fy, scaler.cx, scaler.cy
+            cfg_bev = BEVConfig(
+                x_min = float(bev_cfg.get("x_min", -10.0)),
+                x_max = float(bev_cfg.get("x_max",  10.0)),
+                z_min = float(bev_cfg.get("z_min",   0.0)),
+                z_max = float(bev_cfg.get("z_max",  40.0)),
+                cell  = float(bev_cfg.get("cell",    0.20)),
+                h_min_m = float(bev_cfg.get("h_min_m", 0.18))
+            )
+            bev_proj = BEVProjectorTorch(W, H, fx, fy, cx, cy, cfg_bev, device=device)
+
+        occ_bev = bev_proj.splat(depth_m, seg_id, height_m)
+        bev_proj.set_last_occ(occ_bev)  # để sample điểm
+
+        # 6) Obstacle từ depth-edges (checkpoint)
+        (obs_boxes, obs_dists, obs_scores), dbg = detect_obstacles_by_depth_edges(
+            depth_m_enh, sigma_m, seg_id, eocfg, fx=scaler.fx, fy=scaler.fy
         )
 
-        # 5) YOLO + gán khoảng cách theo dải đáy
-        yolo_xyxy, yolo_scores, yolo_cls, _ = det(rgb, img_size=(640, 384))
+        # 6b) Tăng/giảm score theo occupancy BEV gần (X,Z) của box — KHÔNG gate cứng
+        if len(obs_boxes):
+            bev_boost = bev_proj.occupancy_score_for_boxes(obs_boxes, obs_dists, weight_window=int(bev_cfg.get("win",2)))
+            # normalize nhẹ (0..1) rồi cộng trọng số nhỏ
+            lam = float(bev_cfg.get("boost_lambda", 0.20))
+            obs_scores = obs_scores + lam * bev_boost.detach().cpu().numpy().astype(np.float32)
+
+        # 7) YOLO + đo khoảng cách (q20 dải đáy)
+        yolo_xyxy, yolo_scores, yolo_cls, _ = det(rgb, img_size=(640,384))
         yolo_dists = []
         for b in yolo_xyxy:
-            d_roi = roi_bottom(depth_m, b, frac=0.35)
-            med, q25 = robust_depth_stat(d_roi, min_valid=20)
-            d = float(q25 if np.isfinite(q25) else med)
+            d = depth_from_yolo_box(depth_m, b, frac=0.25)
             yolo_dists.append(d if np.isfinite(d) else np.nan)
         yolo_dists = np.asarray(yolo_dists, dtype=float)
 
-        # filter xa > depth_max_m
+        # Lọc xa > zmax
         zmax = float(ocfg.get("depth_max_m", 10.0))
-        keep_yolo = [i for i in range(len(yolo_xyxy)) if np.isfinite(yolo_dists[i]) and yolo_dists[i] <= zmax]
-        yolo_xyxy = yolo_xyxy[keep_yolo] if len(keep_yolo) else np.zeros((0,4))
-        yolo_scores = yolo_scores[keep_yolo] if len(keep_yolo) else np.zeros((0,))
-        yolo_cls = yolo_cls[keep_yolo] if len(keep_yolo) else np.zeros((0,), dtype=int)
-        yolo_dists = yolo_dists[keep_yolo] if len(keep_yolo) else np.zeros((0,))
+        keep_y = [i for i in range(len(yolo_xyxy)) if (not np.isfinite(yolo_dists[i])) or (yolo_dists[i] <= zmax)]
+        yolo_xyxy  = yolo_xyxy[keep_y] if len(keep_y) else np.zeros((0,4))
+        yolo_scores= yolo_scores[keep_y] if len(keep_y) else np.zeros((0,))
+        yolo_cls   = yolo_cls[keep_y] if len(keep_y) else np.zeros((0,), dtype=int)
+        yolo_dists = yolo_dists[keep_y] if len(keep_y) else np.zeros((0,))
 
-        # 6) Hợp nhất YOLO ↔ obstacle
+        # 8) Hợp nhất YOLO ↔ OBS (nhãn -1 cho OBS)
         boxes, scores, clss, flags, d_init = merge_yolo_obstacle(
             yolo_xyxy, yolo_scores, yolo_cls, yolo_dists,
             obs_boxes, obs_scores, obs_dists,
             iou_merge=float(ocfg.get("iou_merge_yolo", 0.5))
         )
 
-        # 7) NMS + lọc xa
-        if len(boxes) > 0:
-            keep = [i for i in range(len(boxes)) if np.isfinite(d_init[i]) and d_init[i] <= zmax]
-            boxes = boxes[keep]; scores = scores[keep]; clss = clss[keep]; flags = flags[keep]; d_init = d_init[keep]
+        # 9) Re-measure cho OBS bằng ROI đáy masked
+        if len(boxes):
+            for i in range(len(boxes)):
+                if clss[i] < 0:
+                    d = depth_from_obs_box(depth_m, height_m, seg_id, boxes[i],
+                                           foot_h=float(ocfg.get("foot_height_base_m",0.06)), frac=0.25)
+                    if np.isfinite(d): d_init[i] = d
 
-        keep = nms_iou(boxes, scores, iou_thr=float(ocfg.get("nms_iou", 0.55)))
-        boxes = boxes[keep]; scores = scores[keep]; clss = clss[keep]; flags = flags[keep]; d_init = d_init[keep]
+        # 10) NMS + Top-K (gần trước)
+        if len(boxes):
+            keep = nms_iou(boxes, scores, iou_thr=float(ocfg.get("nms_iou",0.55)))
+            boxes = boxes[keep]; scores = scores[keep]; clss = clss[keep]; d_init = d_init[keep]
+            order = np.argsort([ (np.inf if not np.isfinite(z) else z) for z in d_init ])
+            boxes = boxes[order]; scores = scores[order]; clss = clss[order]; d_init = d_init[order]
+            K = int(ocfg.get("topk",18))
+            boxes = boxes[:K]; scores = scores[:K]; clss = clss[:K]; d_init = d_init[:K]
 
-        # Top-K gần nhất
-        if len(boxes) > 0:
-            order = np.argsort(d_init)  # gần trước
-            boxes = boxes[order]; scores = scores[order]; clss = clss[order]; flags = flags[order]; d_init = d_init[order]
-            K = int(ocfg.get("topk", 15))
-            boxes = boxes[:K]; scores = scores[:K]; clss = clss[:K]; flags = flags[:K]; d_init = d_init[:K]
-
-        # 8) Tracking cho YOLO (ID)
-        tracks = tracker.update(yolo_xyxy.tolist(), yolo_scores.tolist(), yolo_cls.tolist())
-
-        # 9) Nhãn hiển thị
+        # 11) Persistence cho OBS
         labels = []
-        for i, b in enumerate(boxes):
-            if clss[i] < 0:
-                label = "obstacle"
+        if len(boxes):
+            obs_idx = [i for i in range(len(boxes)) if clss[i] < 0]
+            if len(obs_idx):
+                p_boxes, p_dists = _update_persistence(
+                    persist_obs, boxes[obs_idx], d_init[obs_idx],
+                    min_vote=int(ocfg.get("persistence_min",3))
+                )
+                keep_yolo_idx = [i for i in range(len(boxes)) if clss[i] >= 0]
+                boxes_y = boxes[keep_yolo_idx]; dists_y = d_init[keep_yolo_idx]; clss_y = clss[keep_yolo_idx]
+                if len(boxes_y):
+                    labels.extend([str(det.names.get(int(c), str(int(c)))) for c in clss_y])
+                if len(p_boxes):
+                    boxes = np.vstack([boxes_y, p_boxes])
+                    d_init = np.hstack([dists_y, p_dists])
+                    clss = np.hstack([clss_y, np.full((len(p_boxes),), -1, dtype=int)])
+                else:
+                    boxes = boxes_y; d_init=dists_y; clss=clss_y
             else:
-                label = str(det.names.get(int(clss[i]), str(int(clss[i]))))
-            labels.append(label)
+                labels = [str(det.names.get(int(c), str(int(c)))) if c>=0 else "OBS" for c in clss]
 
-        # 10) Persistence filter (ổn định hơn)
-        persisted_idx = []
-        pmin = int(ocfg.get("persistence_min", 2))
-        if pmin <= 1:
-            persisted_idx = list(range(len(boxes)))
-        else:
-            for i, b in enumerate(boxes):
-                key = _stable_persist_key(b)
-                persist_map[key] = persist_map.get(key, 0) + 1
-                if persist_map[key] >= pmin:
-                    persisted_idx.append(i)
-
-        # Nếu vì lý do nào đó không có box sau persistence → để nguyên (tránh khung trống mãi)
-        if len(persisted_idx) == 0:
-            persisted_idx = list(range(len(boxes)))
-
-        boxes = boxes[persisted_idx]
-        labels = [labels[i] for i in persisted_idx]
-        d_init = d_init[persisted_idx]
-
-        # 11) Vẽ & ghi
-        vis = draw_boxes(rgb, boxes, labels, d_init, thr=(thr_low, thr_high),
+        # 12) Vẽ
+        vis = draw_boxes(rgb, boxes, labels, d_init, thr=(thr_low,thr_high),
                          thickness=cfg["viz"]["thickness"], font_scale=cfg["viz"]["font_scale"])
-        vis = cv2.resize(vis, (outW, outH), interpolation=cv2.INTER_AREA)
+        hud = [
+            f"edge.num={len(obs_boxes)}  yolo={len(yolo_xyxy)}  merged={len(boxes)}",
+        ]
+        vis = draw_hud(vis, hud)
+        vis = cv2.resize(vis, (outW,outH), interpolation=cv2.INTER_AREA)
         writer.write_rgb(vis)
 
-    writer.release()
-    reader.release()
+    writer.release(); reader.release()
 
 if __name__ == "__main__":
     import argparse
@@ -207,7 +249,6 @@ if __name__ == "__main__":
     parser.add_argument("--out", required=True)
     parser.add_argument("--config", default="configs/config.yaml")
     args = parser.parse_args()
-
     cfg = load_config(args.config)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     process_video(args.src, args.out, cfg)

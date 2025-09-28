@@ -14,7 +14,7 @@ def _is_flat_state_dict(sd: Any) -> bool:
 
 def load_bisenet_from_vendor(weights_path: str = None, device: str = "cuda", num_classes: int = 19, verbose: bool = True) -> Tuple[BiSeNetV2, dict]:
     weights_path = os.path.join(os.path.dirname(__file__), "weights", "bisenetv2_cityscapes.pth")
-    device_t = torch.device(device if torch.cuda.is_available() and device.startswith("cuda") else "cpu")
+    device_t = torch.device(device if torch.cuda.is_available()  else "cpu")
 
     try:
         model = BiSeNetV2(num_classes, aux_mode='eval')

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 @dataclass
 class FramePacket:
     frame_id: int
-    rgb: any      # HxWx3 uint8 RGB
+    rgb: any
     H: int
     W: int
     ts: float
@@ -21,8 +21,7 @@ class VideoReader:
         fid = 0
         while True:
             ok, bgr = self.cap.read()
-            if not ok:
-                break
+            if not ok: break
             fid += 1
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             yield FramePacket(frame_id=fid, rgb=rgb, H=self.H, W=self.W, ts=fid/self.fps)

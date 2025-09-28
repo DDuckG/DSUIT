@@ -9,4 +9,4 @@ run:
 	$(PY) -m src.main --src $(src) --out $(out) --config $(config)
 
 demo:
-	$(MAKE) run src=data/raw_videos/a1.mp4 out=outputs/a2_out.mp4 config=configs/config.yaml
+	$(MAKE) run src=data/raw_videos/a1.mp4 out=outputs/a1_out.mp4 config=configs/config.yaml

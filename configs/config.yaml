@@ -1,7 +1,6 @@
 io:
-  output_fps: 7
+  output_fps: 25
   output_size: [640, 360]
-  reader_backend: "opencv"            # ổn định hơn khi chạy stream + ít phụ thuộc
 
 camera:
   height_m: 1.35
@@ -10,10 +9,11 @@ camera:
 
 models:
   yolo:
-    weights: "models/yolov12/yolov12m.pt"   # 3050 4GB: bản n nhanh hơn; có thể đổi sang m nếu đủ VRAM
+    weights: "models/yolov12/yolov12m.pt"
     conf: 0.40
     iou: 0.60
     half: true
+    imgsz: [896, 512]
     whitelist_classes:
       - 0    # person
       - 1    # bicycle
@@ -100,6 +100,7 @@ models:
     weights: "models/bisenet_v2/weights/bisenetv2_cityscapes.pth"
     half: true
     run_every_k: 3
+
   depth:
     encoder: "vits"
     checkpoint: "models/video_depth_anything/checkpoints/video_depth_anything_vits.pth"
@@ -114,30 +115,45 @@ tracking:
   iou: 0.3
 
 fusion:
-  distance_thresholds_m: [1.8, 3.5]    # màu: đỏ <1.8; vàng 1.8–3.5; xanh >3.5
-
+  distance_thresholds_m: [1.8, 3.5]
   plane_fit:
-    method: "ransac"                   # robust hơn LS
-    inlier_thr_m: 0.05                 # 5 cm
-    max_iter: 150
+    inlier_thr_m: 0.05
+    max_iter: 256
     sample_stride: 4
-    ema_beta: 0.9
-    use_sidewalk: true
-    use_terrain: true
-
-  obstacle:                             # obstacle chung cho toàn khung (không phụ thuộc YOLO)
-    height_min_m: 0.30                 # cao hơn mặt phẳng ≥ 30 cm
-    foot_height_m: 0.06                # vùng “chân” để đo khoảng cách
-    depth_min_m: 0.40
-    depth_max_m: 10.0                  # bỏ xa hơn 10 m
-    downsample: 0.5                    # xử lý CC ở ảnh nhỏ hơn
-    area_min_m2: 0.03                  # lọc vật cực nhỏ
-    iou_merge_yolo: 0.50               # ghép obstacle ↔ YOLO nếu IoU đủ lớn
-    nms_iou: 0.55
-    topk: 15                           # hiển thị nhiều nhất K vật gần nhất
-    persistence_min: 2                 # chỉ vẽ nếu tồn tại ≥2 khung (giảm rác)
-
+    ema_beta: 0.90
+    use_sidewalk: false
+    use_terrain: false
+    refit_every: 12
+    alpha_clamp: [0.75, 1.25]
+    freeze_inlier_min: 300
+  gating:
+    yolo_occ_min: 0.06
+    yolo_kill_after: 3
+  edge_obstacle:
+    edge_percentile_str: 92.0
+    edge_percentile_weak: 85.0
+    mag_thr_rel: 1.00
+    mag_thr_rel_weak: 0.85
+    gauss_k: 5
+    gauss_sigma: 1.15
+    depth_min_m: 0.35
+    depth_max_m: 12.0
+    area_min_m2_k: 2.0e-4
+    snap_dx_px: 24
+    snap_dy_px: 24
+    min_w_px: 6
+    min_h_px: 6
+  bev:
+    x_min: -10.0
+    x_max: 10.0
+    z_min: 0.0
+    z_max: 40.0
+    cell: 0.20
+    h_min_m: 0.18
+    win: 2
+    boost_lambda: 0.20
+    
 viz:
-  thickness: 2
-  font_scale: 0.5
+  thickness: 1
+  font_scale: 0.45
   show_fps: true
