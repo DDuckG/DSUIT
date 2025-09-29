@@ -1,4 +1,3 @@
-# src/utils/torch_cuda.py
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -14,7 +13,6 @@ def to_torch(x, device=None, dtype=None, non_blocking=True):
         if device is not None:
             t = t.to(device, non_blocking=non_blocking)
         return t.contiguous()
-    # numpy -> torch
     t = torch.from_numpy(np.ascontiguousarray(x))
     if dtype is not None:
         t = t.to(dtype)
@@ -26,8 +24,6 @@ def to_numpy(t: torch.Tensor):
     if isinstance(t, np.ndarray):
         return t
     return t.detach().contiguous().cpu().numpy()
-
-# ----------------------- Image ops (GPU friendly) -----------------------
 
 def _gauss_1d(k: int, sigma: float, device, dtype):
     if k <= 1:
@@ -64,9 +60,6 @@ def gaussian_blur(x: torch.Tensor, k: int = 5, sigma: float = 1.0):
 
 @torch.no_grad()
 def sobel_grad(x: torch.Tensor):
-    """
-    x: [H,W] float -> (gx, gy) theo Sobel, GPU
-    """
     device, dtype = x.device, x.dtype
     kx = torch.tensor([[-1, 0, 1],
                        [-2, 0, 2],

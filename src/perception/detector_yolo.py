@@ -1,62 +1,63 @@
-# src/perception/detector_yolo.py
+import numpy as np
 import torch
 from ultralytics import YOLO
 
 class YOLODetector:
-    def __init__(self, weights: str, conf=0.25, iou=0.5, half=False, whitelist=None, device="cuda"):
-        self.model = YOLO(weights)
+    def __init__(self, weights: str, conf=0.25, iou=0.5, half=False, whitelist=None, device="cuda", imgsz=None):
         self.device = device if torch.cuda.is_available() else "cpu"
-        try:
-            self.model.to(self.device)
-            if hasattr(self.model, "model") and self.model.model is not None:
-                self.model.model.float()
-        except Exception:
-            pass
-        self.conf = float(conf); self.iou=float(iou)
-        self.half=False
-        self.whitelist = set(int(x) for x in whitelist) if whitelist is not None else None
+        self.model = YOLO(weights)
+        self.model.to(self.device)
+        if hasattr(self.model, "model") and self.model.model is not None:
+            self.model.model.float()
+        fuse = getattr(self.model, "fuse", None)
+        if callable(fuse):
+            fuse()
+
+        self.conf = float(conf)
+        self.iou = float(iou)
+        self.half = False  # giữ FP32 ổn định
+        self.imgsz = imgsz
+
+        self._whitelist_tensor = (
+            torch.as_tensor(sorted(set(int(x) for x in whitelist)), device=self.device, dtype=torch.int64)
+            if whitelist is not None else None
+        )
+
+        # warm-up để ổn định latency khung đầu
+        H, W = 384, 640
+        if isinstance(self.imgsz, (tuple, list)) and len(self.imgsz) == 2:
+            W, H = int(self.imgsz[0]), int(self.imgsz[1])
+        dummy = np.zeros((H, W, 3), dtype="uint8")
+        with torch.inference_mode():
+            _ = self.model.predict(source=dummy, verbose=False, imgsz=(W, H),
+                                   conf=self.conf, iou=self.iou, device=self.device,
+                                   half=False, stream=False)
 
     @torch.inference_mode()
     def __call__(self, rgb, img_size=None):
-        try:
-            if hasattr(self.model,"model") and self.model.model is not None:
-                self.model.model.float()
-        except Exception:
-            pass
-        pred = self.model.predict(source=rgb, verbose=False, imgsz=img_size,
-                                  conf=self.conf, iou=self.iou, device=self.device,
-                                  half=False, stream=False)[0]
+        imgsz = img_size if img_size is not None else self.imgsz
+        pred = self.model.predict(
+            source=rgb, verbose=False, imgsz=imgsz,
+            conf=self.conf, iou=self.iou, device=self.device,
+            half=False, stream=False
+        )[0]
+
         boxes = pred.boxes
         xyxy = boxes.xyxy
         conf = boxes.conf
         cls  = boxes.cls.to(torch.int64)
 
-        if torch.cuda.is_available():
-            if xyxy.device.type!="cuda": xyxy=xyxy.cuda(non_blocking=True)
-            if conf.device.type!="cuda": conf=conf.cuda(non_blocking=True)
-            if cls.device.type!="cuda":  cls =cls.cuda(non_blocking=True)
+        if self._whitelist_tensor is not None and cls.numel() > 0:
+            keep = torch.isin(cls, self._whitelist_tensor)
+            xyxy = xyxy[keep]
+            conf = conf[keep]
+            cls  = cls[keep]
 
-        if self.whitelist is not None and cls.numel()>0:
-            keep_idx = [i for i,c in enumerate(cls.tolist()) if c in self.whitelist]
-            if len(keep_idx):
-                keep = torch.tensor(keep_idx, device=xyxy.device, dtype=torch.long)
-                xyxy = xyxy.index_select(0, keep)
-                conf = conf.index_select(0, keep)
-                cls  = cls.index_select(0, keep)
-            else:
-                xyxy = torch.zeros((0,4), device=xyxy.device, dtype=xyxy.dtype)
-                conf = torch.zeros((0,), device=xyxy.device, dtype=conf.dtype)
-                cls  = torch.zeros((0,), device=xyxy.device, dtype=torch.int64)
-
-        if hasattr(pred, "orig_img") and pred.orig_img is not None:
-            H,W = pred.orig_img.shape[:2]
-        else:
-            try: H,W = rgb.shape[:2]
-            except: H,W = 0,0
-        return xyxy, conf, cls, (W,H)
+        H, W = rgb.shape[:2]
+        return xyxy, conf, cls, (W, H)
 
     @property
     def names(self):
-        if hasattr(self.model,"model") and getattr(self.model.model,"names",None) is not None:
+        if hasattr(self.model, "model") and getattr(self.model.model, "names", None) is not None:
             return self.model.model.names
         return getattr(self.model, "names", {})

@@ -4,7 +4,6 @@ import torch
 
 ROAD_ID = 0
 
-
 # ------------------------- helpers -------------------------
 
 def _is_torch(x):
