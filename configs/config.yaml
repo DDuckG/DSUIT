@@ -5,9 +5,10 @@ io:
   write_queue: 64
   cpu_threads: 0
   warmup_iters: 12
+  mem_gc_every: 0
 
 camera:
-  height_m: 0.77
+  height_m: 1.35
   fov_deg_h: 68.0
   principal: [0.5, 0.5]
 
@@ -118,18 +119,33 @@ tracking:
     max_age: 1
     iou: 0.3
   obs:
-    max_age: 0           # kill ngay khi mất match
+    max_age: 0
     iou: 0.5
+    # --- staging/commit ---
+    staging:
+      window: 6
+      min_hits: 4
+      iou_min: 0.35
+      twoedge_min: 3
+      z_mad_max: 0.6
+      yolo_cover_thr: 0.90
+      yolo_iou_thr: 0.60
+    # --- lock/hysteresis sau commit ---
+    lock:
+      search_dx_px: 8
+      search_dy_px: 8
+      ema_beta: 0.80
+      max_scale_change: 0.15
 
 fusion:
   distance_thresholds_m: [1.8, 3.5]
 
   plane_fit:
     method: ransac
-    inlier_thr_m: 0.07
+    inlier_thr_m: 0.05
     max_iter: 180
     sample_stride: 4
-    ema_beta: 0.95
+    ema_beta: 0.9
     use_sidewalk: true
     use_terrain: true
 
@@ -172,6 +188,19 @@ fusion:
     min_h_px: 12
     h_min_m: 0.05
 
+  edge_inside:
+    ribbon_px: 3
+    search_dx_px: 18
+    search_dy_px: 14
+    jump_min_m: 0.25
+    var_in_max: 0.08
+    fill_min: 0.55
+
+  pole:
+    min_len_px: 28
+    max_w_px: 16
+    nms_x_px: 12
+
   obs_sliver:
     min_w_px: 10
     min_h_px: 10
@@ -187,10 +216,10 @@ fusion:
   z_max_obs_m: 15.0
 
   depth_calib:
-    gamma: 0.85    # 0.8–0.9 để nén mạnh phần xa
-    scale: 0.815   # tính theo công thức ở trên để “neo” đúng mốc gần
+    gamma: 0.95    # 0.8–0.9 để nén mạnh phần xa
+    scale: 0.4     # tính theo công thức ở trên để “neo” đúng mốc gần
 
 viz:
   thickness: 2
   font_scale: 0.45
-  show_fps: true
+  show_fps: true  

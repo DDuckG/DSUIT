@@ -18,9 +18,54 @@ from src.fusion.ground_plane import GroundPlaneScaler
 from src.fusion.depth_enhance import DepthEnhancer
 from src.fusion.depth_edges import detect_obstacles_by_depth_edges, refine_box_by_edges_and_height, two_edge_ok_array
 from src.fusion.planar_patch import detect_planar_obstacles
+from src.fusion.pole_proposals import detect_poles_from_depth
+from src.fusion.edge_inside import snap_inside_box
 from src.fusion.obs_sliver import prune_obs_slivers
-from src.fusion.depth_utils import distance_from_box          # <— dùng phương pháp cũ để đo khoảng cách YOLO
-from src.utils.geom import nms_iou
+from src.fusion.depth_utils import distance_from_box
+from src.utils.geom import iou_matrix
+
+# ---------- helpers ----------
+def _normalize_names(names):
+    # trả về list/tuple các tên lớp
+    if isinstance(names, (list, tuple)):
+        return list(names)
+    # YOLOv5/8 thường là dict {id:name}
+    if hasattr(names, "keys"):
+        # map thành list theo thứ tự id
+        try:
+            maxk = max(int(k) for k in names.keys())
+            out = [""] * (maxk + 1)
+            for k, v in names.items():
+                ki = int(k)
+                if 0 <= ki < len(out): out[ki] = str(v)
+            return out
+        except Exception:
+            return [str(names.get(i, i)) for i in range(100)]
+    # fallback
+    return []
+
+def _label_from_id(cid, names_list):
+    cid = int(cid)
+    if 0 <= cid < len(names_list):
+        return str(names_list[cid])
+    return str(cid)
+
+def _match_tracks_to_dets(track_boxes, det_boxes):
+    # trả về index detection tốt nhất cho mỗi track (hoặc -1 nếu không match)
+    if track_boxes.shape[0] == 0 or det_boxes.shape[0] == 0:
+        return np.full((track_boxes.shape[0],), -1, dtype=np.int32)
+    M = iou_matrix(track_boxes.astype(np.float32), det_boxes.astype(np.float32))
+    det_assigned = -np.ones((track_boxes.shape[0],), dtype=np.int32)
+    used_d = np.zeros((det_boxes.shape[0],), dtype=bool)
+    # greedy theo IoU
+    for ti in range(track_boxes.shape[0]):
+        di = int(np.argmax(M[ti]))
+        if M[ti, di] <= 0.0 or used_d[di]:
+            det_assigned[ti] = -1
+        else:
+            det_assigned[ti] = di
+            used_d[di] = True
+    return det_assigned
 
 @torch.inference_mode()
 def _warmup_pipeline(det, seg_model, dep, scaler, enh, W, H, y_imgsz):
@@ -29,7 +74,7 @@ def _warmup_pipeline(det, seg_model, dep, scaler, enh, W, H, y_imgsz):
     seg_id = seg_model(rgb0)
     alpha, plane = scaler.estimate_scale(depth_rel, seg_id)
     depth_m = alpha / (np.maximum(depth_rel, 1e-6))
-    depth_m_enh, sigma_m = enh(depth_m, rgb0)
+    _ = enh(depth_m, rgb0)
     _ = det(rgb0, img_size=y_imgsz)
 
 @torch.inference_mode()
@@ -76,20 +121,29 @@ def process_video(src_path: str, out_path: str, cfg: dict):
     )
 
     thr_low, thr_high = cfg["fusion"]["distance_thresholds_m"]
-    eocfg = cfg["fusion"]["epp"]     # edge proposals
-    ppcfg = cfg["fusion"]["ppp"]     # planar proposals
+    eocfg = cfg["fusion"]["epp"]
+    ppcfg = cfg["fusion"]["ppp"]
     slcfg = cfg["fusion"]["obs_sliver"]
     zmax_obs = float(cfg["fusion"].get("z_max_obs_m", 15.0))
+    incfg = cfg["fusion"]["edge_inside"]
+    polecfg= cfg["fusion"]["pole"]
 
     # Trackers
     tracker_y = OCSort(max_age=cfg["tracking"]["yolo"]["max_age"], iou_thr=cfg["tracking"]["yolo"]["iou"])
-    tracker_o = ObsTracker(iou_thr=cfg["tracking"]["obs"]["iou"], max_age=cfg["tracking"]["obs"]["max_age"], z_max=zmax_obs, edge_fail_kill=2)
+    tracker_o = ObsTracker(
+        iou_thr=cfg["tracking"]["obs"]["iou"],
+        max_age=cfg["tracking"]["obs"]["max_age"],
+        z_max=zmax_obs,
+        edge_fail_kill=2,
+        staging=cfg["tracking"]["obs"].get("staging", {}),
+        lock=cfg["tracking"]["obs"].get("lock", {})
+    )
 
     # Warm-up
     y_imgsz = tuple(ycfg.get("imgsz", (640,384)))
     enh = DepthEnhancer(cfg["fusion"].get("edge_enhance", {"gauss_k":5,"gauss_sigma":1.2}))
     _warmup_pipeline(det, seg_model, dep, scaler, enh, reader.W, reader.H, y_imgsz)
-    print("[READY] Pipeline B warmed up. Start streaming frames...")
+    print("[READY] Pipeline D warmed up. Start streaming frames...")
 
     stride = max(1, int(round(reader.fps / float(cfg["io"]["output_fps"]))))
     last_seg = None
@@ -125,6 +179,25 @@ def process_video(src_path: str, out_path: str, cfg: dict):
         height_m = scaler.height_from_plane(depth_m, plane)
         height_t = torch.from_numpy(height_m).to(device=device, dtype=torch.float32)
 
+        # ==== YOLO: detections + names ====
+        yolo_xyxy, yolo_scores, yolo_cls, yolo_names = det(rgb, img_size=y_imgsz)
+        y_names = _normalize_names(yolo_names)
+        if yolo_xyxy.numel() > 0:
+            yb = yolo_xyxy.detach().cpu().numpy().astype(np.float32)
+            ys = yolo_scores.detach().cpu().numpy().astype(np.float32)
+            yc = yolo_cls.detach().cpu().numpy().astype(np.int32)
+        else:
+            yb = np.zeros((0,4), dtype=np.float32); ys = np.zeros((0,), dtype=np.float32); yc = np.zeros((0,), dtype=np.int32)
+
+        # ==== Tính distance cho YOLO detections để tô màu ====
+        # dùng depth_m (m) + height_m + seg_id và logic trong depth_utils.distance_from_box
+        if yb.shape[0] > 0:
+            y_dists = np.empty((yb.shape[0],), dtype=np.float32)
+            for i in range(yb.shape[0]):
+                y_dists[i] = float(distance_from_box(depth_m, height_m, seg_id, yb[i], foot_h=0.06, frac=0.25))
+        else:
+            y_dists = np.zeros((0,), dtype=np.float32)
+
         # ==== OBS PROPOSALS ====
         (e_boxes, e_dists, e_scores, e_edgeok), _ = detect_obstacles_by_depth_edges(
             depth_m_enh, sigma_m, seg_id, eocfg, fx=scaler.fx, fy=scaler.fy, height_m=height_m
@@ -132,41 +205,45 @@ def process_video(src_path: str, out_path: str, cfg: dict):
         p_boxes, p_dists, p_scores = detect_planar_obstacles(
             depth_m_enh, sigma_m, seg_id, height_m, ppcfg, fx=scaler.fx, fy=scaler.fy
         )
-        p_edgeok = np.ones((p_boxes.shape[0],), dtype=bool) if p_boxes.shape[0] > 0 else np.zeros((0,), dtype=bool)
+        v_boxes, v_dists, v_scores = detect_poles_from_depth(depth_m_enh, polecfg)
 
-        # YOLO (dùng để protect + để vẽ)
-        yolo_xyxy, yolo_scores, yolo_cls, _ = det(rgb, img_size=y_imgsz)
-        if yolo_xyxy.numel() > 0:
-            yolo_boxes_np = yolo_xyxy.detach().cpu().numpy().astype(np.float32)
-            yolo_scores_np = yolo_scores.detach().cpu().numpy().astype(np.float32)
-            yolo_cls_np    = yolo_cls.detach().cpu().numpy().astype(np.int32)
-        else:
-            yolo_boxes_np = np.zeros((0,4), dtype=np.float32)
-            yolo_scores_np= np.zeros((0,), dtype=np.float32)
-            yolo_cls_np   = np.zeros((0,), dtype=np.int32)
-
-        # Union & prune OBS
-        if e_boxes.shape[0] + p_boxes.shape[0] > 0:
-            boxes  = np.concatenate([e_boxes, p_boxes], axis=0)
-            scores = np.concatenate([e_scores, p_scores], axis=0)
-            dists  = np.concatenate([e_dists, p_dists], axis=0)
-            edgeok = np.concatenate([e_edgeok, p_edgeok], axis=0)
+        # Union proposals
+        N_all = e_boxes.shape[0] + p_boxes.shape[0] + v_boxes.shape[0]
+        if N_all > 0:
+            if v_boxes.shape[0] > 0:
+                boxes  = np.concatenate([e_boxes, p_boxes, v_boxes], axis=0)
+                scores = np.concatenate([e_scores, p_scores, v_scores], axis=0)
+                dists  = np.concatenate([e_dists, p_dists, v_dists], axis=0)
+                edgeok = np.concatenate([e_edgeok, np.ones((p_boxes.shape[0],), dtype=bool), np.ones((v_boxes.shape[0],), dtype=bool)], axis=0)
+            else:
+                boxes  = np.concatenate([e_boxes, p_boxes], axis=0)
+                scores = np.concatenate([e_scores, p_scores], axis=0)
+                dists  = np.concatenate([e_dists, p_dists], axis=0)
+                edgeok = np.concatenate([e_edgeok, np.ones((p_boxes.shape[0],), dtype=bool)], axis=0)
         else:
             boxes = np.zeros((0,4), dtype=np.float32)
             scores= np.zeros((0,), dtype=np.float32)
             dists = np.zeros((0,), dtype=np.float32)
             edgeok= np.zeros((0,), dtype=bool)
 
+        # Prune slivers & YOLO-protect
+        yolo_boxes_np = yb if yb.shape[0] > 0 else np.zeros((0,4), dtype=np.float32)
         if boxes.shape[0] > 0:
             boxes, scores, dists = prune_obs_slivers(
                 boxes_xyxy=boxes, scores=scores, dists_m=dists, yolo_boxes=yolo_boxes_np, cfg=slcfg
             )
-            keep = np.where((~np.isfinite(dists)) | (dists <= zmax_obs))[0]
-            boxes = boxes[keep]; scores = scores[keep]; dists = dists[keep]
-            D = torch.from_numpy(depth_m_enh).to(device=device, dtype=torch.float32)
-            Dl = torch.log(torch.clamp(D, min=1e-3))
-            from src.utils.torch_cuda import sobel_grad
-            gx, gy = sobel_grad(Dl)
+
+        # ==== OBS TRACK ====
+        D = torch.from_numpy(depth_m_enh).to(device=device, dtype=torch.float32)
+        Dl = torch.log(torch.clamp(D, min=1e-3))
+        from src.utils.torch_cuda import sobel_grad
+        gx, gy = sobel_grad(Dl)
+        def _refine(bx_np):
+            b1 = refine_box_by_edges_and_height(bx_np, gx, gy, height_t, eocfg)
+            b2 = snap_inside_box(b1, D, cfg=incfg)
+            return b2
+
+        if boxes.shape[0] > 0:
             edge_ok_final = two_edge_ok_array(
                 boxes, gx, gy,
                 k=int(eocfg.get("twoedge_band_px",3)),
@@ -176,42 +253,31 @@ def process_video(src_path: str, out_path: str, cfg: dict):
         else:
             edge_ok_final = np.zeros((0,), dtype=bool)
 
-        # ==== YOLO TRACK (vẫn OCSort), nhưng GIỜ có khoảng cách để tô màu & text ====
-        # Khoảng cách YOLO bằng phương pháp cũ: depth_m + height_m + seg (trung thành với distance_from_box)
-        if yolo_boxes_np.shape[0] > 0:
-            foot_h = float(cfg["fusion"].get("obstacle", {}).get("foot_height_m", 0.06))
-            # frac của band đáy: giữ mặc định 0.25 của hàm distance_from_box (không đổi phương pháp)
-            yolo_dists = np.asarray(
-                [distance_from_box(depth_m, height_m, seg_id, b, foot_h=foot_h, frac=0.25) for b in yolo_boxes_np],
-                dtype=np.float32
-            )
-        else:
-            yolo_dists = np.zeros((0,), dtype=np.float32)
+        obs_tracks  = tracker_o.update(boxes, scores, dists, _refine, (W,H), edge_ok_final, yolo_boxes_np)
 
-        y_tracks = tracker_y.update(yolo_boxes_np, yolo_scores_np, yolo_cls_np, yolo_dists)
+        # ==== YOLO TRACK ====
+        y_tracks = tracker_y.update(yb, ys, yc, None)
 
-        # ==== OBS TRACK (giữ nguyên) ====
-        D = torch.from_numpy(depth_m_enh).to(device=device, dtype=torch.float32)
-        Dl = torch.log(torch.clamp(D, min=1e-3))
-        from src.utils.torch_cuda import sobel_grad
-        gx, gy = sobel_grad(Dl)
-        def _refine(bx_np):
-            return refine_box_by_edges_and_height(bx_np, gx, gy, height_t, eocfg)
-        obs_tracks  = tracker_o.update(boxes, scores, dists, _refine, (W,H), edge_ok_final)
-
-        # ==== VIZ ====
+        # Gán label + distance cho YOLO tracks bằng IoU với detections hiện tại
         draw_boxes_arr, draw_dists_arr, labels = [], [], []
 
-        # YOLO: name tag + màu theo khoảng cách (giống OBS)
-        if len(y_tracks):
-            for tid, tb, ts, tc, tz, is_pred in y_tracks:
+        if len(y_tracks) > 0:
+            t_boxes = np.stack([tb for (_id, tb, _s, _c, _z, _p) in y_tracks], axis=0).astype(np.float32)
+            det_idx = _match_tracks_to_dets(t_boxes, yb)
+            for k, tr in enumerate(y_tracks):
+                tid, tb, ts, tc, tz, is_pred = tr
+                di = det_idx[k]
+                if di >= 0:
+                    lbl = _label_from_id(yc[di], y_names)
+                    dz  = float(y_dists[di]) if np.isfinite(y_dists[di]) and y_dists[di] > 0 else np.nan
+                else:
+                    lbl = _label_from_id(tc, y_names)  # fallback theo class id trong track
+                    dz  = np.nan
                 draw_boxes_arr.append(tb)
-                draw_dists_arr.append(tz if np.isfinite(tz) else np.nan)
-                # tên lớp: ưu tiên map từ model, fallback id
-                cname = det.names.get(int(tc), str(int(tc))) if hasattr(det, "names") else str(int(tc))
-                labels.append(cname)
+                draw_dists_arr.append(dz)
+                labels.append(lbl)
 
-        # OBS giữ nguyên
+        # ==== OBS VIZ ====
         if len(obs_tracks):
             for tid, tb, ts, tc, tz, is_pred in obs_tracks:
                 draw_boxes_arr.append(tb)
@@ -223,7 +289,7 @@ def process_video(src_path: str, out_path: str, cfg: dict):
 
         vis = draw_boxes(rgb, draw_boxes_arr, labels, draw_dists_arr, thr=(thr_low,thr_high),
                          thickness=cfg["viz"]["thickness"], font_scale=cfg["viz"]["font_scale"])
-        hud = [f"OBS:epp={e_boxes.shape[0]} ppp={p_boxes.shape[0]} out={len(obs_tracks)}  YOLO:{yolo_boxes_np.shape[0]} trk={len(y_tracks)}  alpha={alpha:.3f}"]
+        hud = [f"OBS:epp={e_boxes.shape[0]} ppp={p_boxes.shape[0]} pole={v_boxes.shape[0]} out={len(obs_tracks)}  YOLO:{yb.shape[0]} trk={len(y_tracks)}  alpha={alpha:.3f}"]
         vis = draw_hud(vis, hud)
         vis = cv2.resize(vis, (outW,outH), interpolation=cv2.INTER_AREA)
         writer.write_rgb(vis)
