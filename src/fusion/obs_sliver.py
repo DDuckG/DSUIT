@@ -1,10 +1,10 @@
+# src/fusion/obs_sliver.py
 import numpy as np
 
 _EPS = 1e-6
 
 def _as_np_f32(x, shape2=False):
-    a = np.asarray(x)
-    a = a.astype(np.float32, copy=False)
+    a = np.asarray(x, dtype=np.float32)
     if shape2 and a.ndim == 1 and a.size == 0:
         return a.reshape(0, 4)
     return a
@@ -24,7 +24,7 @@ def _pairwise_intersection_area(A, B):
     return iw * ih
 
 def _center_greedy_suppress(boxes, scores, dists_m, center_thr_px=18.0, z_thr_m=0.6):
-    # Giống "NMS theo tâm": giữ box score cao, khử box có tâm quá gần và |Δz| nhỏ
+    # NMS theo tâm: giữ box có score cao; khử box có tâm gần và Δz nhỏ
     if boxes.shape[0] == 0:
         return np.zeros((0,), dtype=np.int32)
     cx = 0.5*(boxes[:,0] + boxes[:,2])
@@ -46,76 +46,75 @@ def _center_greedy_suppress(boxes, scores, dists_m, center_thr_px=18.0, z_thr_m=
             close &= np.isfinite(dz) & (dz < float(z_thr_m))
         idx_close = order[close]
         removed[idx_close] = True
-        removed[i] = False  # vẫn giữ i
+        removed[i] = False
     return np.asarray(keep, dtype=np.int32)
 
 def prune_obs_slivers(
     boxes_xyxy,
     scores,
-    dists_m,
+    dists=None,             # tên chuẩn
     yolo_boxes=None,
-    cfg=None
+    cfg=None,
+    **kwargs                # cho phép alias dists_m từ code cũ
 ):
     """
-    Parameters
-    ----------
-    boxes_xyxy : np.ndarray [N,4] (x1,y1,x2,y2), float32
-    scores     : np.ndarray [N], float32
-    dists_m    : np.ndarray [N], float32   # khoảng cách đã là mét
-    yolo_boxes : np.ndarray [M,4] (tùy chọn), float32
-    cfg        : dict (tùy chọn) – các khóa:
-        min_w_px: int (>=)            [default 6]
-        min_h_px: int (>=)            [default 6]
-        min_area_px: float (>=)       [default 48]
-        score_min: float (>=)         [default 0.00]
-
-        slender_ar_min: float         [default 2.5]  # h/w
-        slender_w_max_px: int         [default 18]   # w nhỏ
-        slender_h_min_px: int         [default 6]    # h quá nhỏ
-
-        center_merge_px: float        [default 20.0] # gom cụm theo tâm
-        center_z_thr_m: float         [default 0.6]  # |Δz| để gom
-
-        yolo_cover_thr: float         [default 0.90] # tỉ lệ phủ (area_inter / area_obs)
-        z_min_keep_m: float           [default 0.20]
-        z_max_keep_m: float           [default 80.0]
-    Returns
-    -------
-    boxes_f, scores_f, dists_f : đã lọc, dtype float32
+    Lọc nhiễu cho OBS boxes (general obstacles)
+    ---
+    Tham số (cfg, gợi ý default):
+        min_w_px: 8
+        min_h_px: 8
+        min_area_px: 64
+        score_min: 0.00
+        slender_ar_min: 2.8
+        slender_w_max_px: 20
+        slender_h_min_px: 6
+        center_merge_px: 22
+        center_z_thr_m: 0.6
+        yolo_cover_thr: 0.90
+        z_min_keep_m: 0.20
+        z_max_keep_m: 80.0
     """
+    if dists is None and ("dists_m" in kwargs):
+        dists = kwargs["dists_m"]
+
     cfg = cfg or {}
     b = _as_np_f32(boxes_xyxy, shape2=True).reshape(-1, 4)
     s = _as_np_f32(scores).reshape(-1)
-    z = _as_np_f32(dists_m).reshape(-1)
+    if dists is None:
+        z = np.full((b.shape[0],), np.nan, dtype=np.float32)
+    else:
+        z = _as_np_f32(dists).reshape(-1)
 
-    if b.shape[0] == 0:
+    n = b.shape[0]
+    s = s[:n]
+    z = z[:n]
+
+    if n == 0:
         return b, s, z
 
     # --- Tham số ---
-    min_w = float(cfg.get("min_w_px", 6))
-    min_h = float(cfg.get("min_h_px", 6))
-    min_area = float(cfg.get("min_area_px", 48.0))
+    min_w = float(cfg.get("min_w_px", 8))
+    min_h = float(cfg.get("min_h_px", 8))
+    min_area = float(cfg.get("min_area_px", 64.0))
     s_min = float(cfg.get("score_min", 0.00))
 
-    ar_min   = float(cfg.get("slender_ar_min", 2.5))
-    w_max_sl = float(cfg.get("slender_w_max_px", 18))
+    ar_min   = float(cfg.get("slender_ar_min", 2.8))
+    w_max_sl = float(cfg.get("slender_w_max_px", 20))
     h_min_sl = float(cfg.get("slender_h_min_px", 6))
 
-    c_merge  = float(cfg.get("center_merge_px", 20.0))
+    c_merge  = float(cfg.get("center_merge_px", 22.0))
     z_merge  = float(cfg.get("center_z_thr_m", 0.6))
 
     ycov_thr = float(cfg.get("yolo_cover_thr", 0.90))
     zmin_k   = float(cfg.get("z_min_keep_m", 0.20))
     zmax_k   = float(cfg.get("z_max_keep_m", 80.0))
 
-    # --- Tiền lọc theo kích thước / score / z ---
+    # --- Tiền lọc theo kích thước / score / z / dạng "cọng chỉ" ---
     w, h, ar = _wh_ar(b)
     area = w * h
 
     keep = (w >= min_w) & (h >= min_h) & (area >= min_area) & (s >= s_min)
-    # slender dạng "cọng chỉ": h/w lớn, w nhỏ hoặc h quá nhỏ
     keep &= ~(((ar >= ar_min) & (w <= w_max_sl)) | (h <= h_min_sl))
-    # khoảng cách hợp lý
     keep &= (np.isnan(z) | ((z >= zmin_k) & (z <= zmax_k)))
 
     if not np.any(keep):
@@ -123,15 +122,14 @@ def prune_obs_slivers(
 
     b = b[keep]; s = s[keep]; z = z[keep]
 
-    # --- YOLO-protect: drop obs nếu phần LỚN nằm BÊN TRONG bất kỳ YOLO-box nào ---
+    # --- YOLO-protect: drop OBS nếu phần LỚN nằm BÊN TRONG 1 YOLO-box ---
     if yolo_boxes is not None:
         Y = _as_np_f32(yolo_boxes, shape2=True).reshape(-1, 4)
         if Y.shape[0] > 0 and b.shape[0] > 0:
             inter = _pairwise_intersection_area(b, Y)            # [N,M]
-            area_obs = (np.maximum(0.0, b[:,2]-b[:,0]) * np.maximum(0.0, b[:,3]-b[:,1]))[:,None] + _EPS
-            cover = inter / area_obs                              # (area_inter / area_obs)
-            max_cover = np.max(cover, axis=1)                     # [N]
-            keep2 = max_cover < ycov_thr                           # nếu phủ >= thr -> drop
+            area_obs = (np.maximum(0.0, b[:,2]-b[:,0]) * np.maximum(0.0, b[:,3]-b[:,1])) + _EPS
+            max_cover = inter.max(axis=1) / area_obs             # (area_inter / area_obs)
+            keep2 = max_cover < ycov_thr
             if not np.any(keep2):
                 return b[:0], s[:0], z[:0]
             b = b[keep2]; s = s[keep2]; z = z[keep2]

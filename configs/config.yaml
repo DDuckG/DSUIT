@@ -1,7 +1,7 @@
 io:
   output_fps: 25
   output_size: [640, 360]
-  prefetch: 8
+  prefetch: 16
   write_queue: 64
   cpu_threads: 0
   warmup_iters: 12
@@ -118,52 +118,63 @@ tracking:
     max_age: 1
     iou: 0.3
   obs:
-    max_age: 1
-    iou: 0.3
+    max_age: 0           # kill ngay khi mất match
+    iou: 0.5
 
 fusion:
-  edge_obstacle:
-    edge_percentile_str: 96.0
-    edge_percentile_weak: 92.0
-    mag_thr_rel: 1.20
-    mag_thr_rel_weak: 1.00
+  distance_thresholds_m: [1.8, 3.5]
+
+  plane_fit:
+    method: ransac
+    inlier_thr_m: 0.05
+    max_iter: 180
+    sample_stride: 4
+    ema_beta: 0.9
+    use_sidewalk: true
+    use_terrain: true
+
+  edge_enhance:
+    gauss_k: 5
+    gauss_sigma: 1.2
+    log_eps: 1e-6
+
+  epp:
+    edge_percentile_str: 92.0
+    edge_percentile_weak: 85.0
+    mag_thr_rel: 1.0
+    mag_thr_rel_weak: 0.85
     gauss_k: 5
     gauss_sigma: 1.15
     depth_min_m: 0.35
-    depth_max_m: 12.0
-    area_min_m2_k: 6.0e-4
+    depth_max_m: 15.0
+    area_min_m2_k: 3.0e-4
     snap_dx_px: 24
     snap_dy_px: 24
-    min_w_px: 10
-    min_h_px: 10
-    snap_ignore_bottom_frac: 0.10
-    bottom_h_free_m: 0.07
-    bottom_band_px: 12
-    bottom_min_drop_m: 0.12
-
-  bev:
-    win: 2
-    boost_lambda: 0.15   # giảm nhẹ boost để tránh khuếch đại nhiễu
-
-  obstacle:
-    nms_iou: 0.45
-    topk: 15
-
-  depth_percentile:
-    yolo_q: 0.40
-    obs_q: 0.35
-    foot_band_px: 12
-
-  depth_metric:
-    scale_k: 2.2        # tăng lên -> khoảng cách lớn hơn, giảm xuống -> nhỏ hơn
-    median_region: bottom
-    region_frac: 0.5    # dùng nửa dưới khung hình
-    clip_min_m: 0.2
-    clip_max_m: 80.0
-
-  obs_sliver:
     min_w_px: 8
     min_h_px: 8
+    snap_ignore_bottom_frac: 0.12
+    bottom_h_free_m: 0.05
+    bottom_band_px: 12
+    bottom_min_drop_m: 0.10
+    twoedge_band_px: 3
+    twoedge_v_min: 0.0025
+    twoedge_h_min: 0.0025
+    tile_rows: 3
+    tile_cols: 6
+
+  ppp:
+    depth_min_m: 0.35
+    depth_max_m: 15.0
+    sigma_thr: 0.05
+    grad_thr_in: 0.02
+    area_min_m2_k: 4.0e-4
+    min_w_px: 12
+    min_h_px: 12
+    h_min_m: 0.05
+
+  obs_sliver:
+    min_w_px: 10
+    min_h_px: 10
     min_area_px: 64
     slender_ar_min: 2.8
     slender_w_max_px: 20
@@ -172,7 +183,9 @@ fusion:
     yolo_cover_thr: 0.90
     z_min_keep_m: 0.2
     z_max_keep_m: 80.0
-    
+
+  z_max_obs_m: 15.0
+
 viz:
   thickness: 2
   font_scale: 0.45
