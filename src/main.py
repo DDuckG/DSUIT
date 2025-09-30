@@ -19,6 +19,7 @@ from src.fusion.depth_enhance import DepthEnhancer
 from src.fusion.depth_edges import detect_obstacles_by_depth_edges, refine_box_by_edges_and_height, two_edge_ok_array
 from src.fusion.planar_patch import detect_planar_obstacles
 from src.fusion.obs_sliver import prune_obs_slivers
+from src.fusion.depth_utils import distance_from_box          # <— dùng phương pháp cũ để đo khoảng cách YOLO
 from src.utils.geom import nms_iou
 
 @torch.inference_mode()
@@ -113,6 +114,9 @@ def process_video(src_path: str, out_path: str, cfg: dict):
         # Scale & plane
         alpha, plane = scaler.estimate_scale(depth_rel, seg_id)
         depth_m = alpha / (np.maximum(depth_rel, 1e-6))
+        g  = float(cfg["fusion"].get("depth_calib", {}).get("gamma", 1.0))
+        s  = float(cfg["fusion"].get("depth_calib", {}).get("scale", 1.0))
+        depth_m = (depth_m ** g) * s
 
         # Enhance & sigma
         depth_m_enh, sigma_m = enh(depth_m, rgb)
@@ -122,28 +126,26 @@ def process_video(src_path: str, out_path: str, cfg: dict):
         height_t = torch.from_numpy(height_m).to(device=device, dtype=torch.float32)
 
         # ==== OBS PROPOSALS ====
-        # Edge-based (EPP) with tile-adaptive + 2-edge
         (e_boxes, e_dists, e_scores, e_edgeok), _ = detect_obstacles_by_depth_edges(
             depth_m_enh, sigma_m, seg_id, eocfg, fx=scaler.fx, fy=scaler.fy, height_m=height_m
         )
-
-        # Planar patches (PPP) for big flat objects
         p_boxes, p_dists, p_scores = detect_planar_obstacles(
             depth_m_enh, sigma_m, seg_id, height_m, ppcfg, fx=scaler.fx, fy=scaler.fy
         )
-        if p_boxes.shape[0] > 0:
-            p_edgeok = np.ones((p_boxes.shape[0],), dtype=bool)
-        else:
-            p_edgeok = np.zeros((0,), dtype=bool)
+        p_edgeok = np.ones((p_boxes.shape[0],), dtype=bool) if p_boxes.shape[0] > 0 else np.zeros((0,), dtype=bool)
 
-        # Union & prune (yolo-protect, center-merge, slender)
-        # YOLO for protect mask
+        # YOLO (dùng để protect + để vẽ)
         yolo_xyxy, yolo_scores, yolo_cls, _ = det(rgb, img_size=y_imgsz)
         if yolo_xyxy.numel() > 0:
             yolo_boxes_np = yolo_xyxy.detach().cpu().numpy().astype(np.float32)
+            yolo_scores_np = yolo_scores.detach().cpu().numpy().astype(np.float32)
+            yolo_cls_np    = yolo_cls.detach().cpu().numpy().astype(np.int32)
         else:
             yolo_boxes_np = np.zeros((0,4), dtype=np.float32)
+            yolo_scores_np= np.zeros((0,), dtype=np.float32)
+            yolo_cls_np   = np.zeros((0,), dtype=np.int32)
 
+        # Union & prune OBS
         if e_boxes.shape[0] + p_boxes.shape[0] > 0:
             boxes  = np.concatenate([e_boxes, p_boxes], axis=0)
             scores = np.concatenate([e_scores, p_scores], axis=0)
@@ -159,51 +161,61 @@ def process_video(src_path: str, out_path: str, cfg: dict):
             boxes, scores, dists = prune_obs_slivers(
                 boxes_xyxy=boxes, scores=scores, dists_m=dists, yolo_boxes=yolo_boxes_np, cfg=slcfg
             )
-            # Z-gate OBS ≤ zmax_obs
             keep = np.where((~np.isfinite(dists)) | (dists <= zmax_obs))[0]
             boxes = boxes[keep]; scores = scores[keep]; dists = dists[keep]
-            # recompute 2-edge ok for final boxes (anew)
-            # need gradients: recompute from depth_m_enh
             D = torch.from_numpy(depth_m_enh).to(device=device, dtype=torch.float32)
             Dl = torch.log(torch.clamp(D, min=1e-3))
             from src.utils.torch_cuda import sobel_grad
             gx, gy = sobel_grad(Dl)
-            edge_ok_final = two_edge_ok_array(boxes, gx, gy, k=int(eocfg.get("twoedge_band_px",3)),
-                                              vthr=float(eocfg.get("twoedge_v_min",0.0025)),
-                                              hthr=float(eocfg.get("twoedge_h_min",0.0025)))
+            edge_ok_final = two_edge_ok_array(
+                boxes, gx, gy,
+                k=int(eocfg.get("twoedge_band_px",3)),
+                vthr=float(eocfg.get("twoedge_v_min",0.0025)),
+                hthr=float(eocfg.get("twoedge_h_min",0.0025))
+            )
         else:
             edge_ok_final = np.zeros((0,), dtype=bool)
 
-        # ==== YOLO TRACK ====
-        if yolo_xyxy.numel() > 0:
-            yb = yolo_xyxy.detach().cpu().numpy().astype(np.float32)
-            ys = yolo_scores.detach().cpu().numpy().astype(np.float32)
-            yc = yolo_cls.detach().cpu().numpy().astype(np.int32)
+        # ==== YOLO TRACK (vẫn OCSort), nhưng GIỜ có khoảng cách để tô màu & text ====
+        # Khoảng cách YOLO bằng phương pháp cũ: depth_m + height_m + seg (trung thành với distance_from_box)
+        if yolo_boxes_np.shape[0] > 0:
+            foot_h = float(cfg["fusion"].get("obstacle", {}).get("foot_height_m", 0.06))
+            # frac của band đáy: giữ mặc định 0.25 của hàm distance_from_box (không đổi phương pháp)
+            yolo_dists = np.asarray(
+                [distance_from_box(depth_m, height_m, seg_id, b, foot_h=foot_h, frac=0.25) for b in yolo_boxes_np],
+                dtype=np.float32
+            )
         else:
-            yb = np.zeros((0,4), dtype=np.float32)
-            ys = np.zeros((0,), dtype=np.float32)
-            yc = np.zeros((0,), dtype=np.int32)
-        y_tracks = tracker_y.update(yb, ys, yc, None)
+            yolo_dists = np.zeros((0,), dtype=np.float32)
 
-        # ==== OBS TRACK ====
-        # refine function (edge snap + cut-bottom) for matched tracks
+        y_tracks = tracker_y.update(yolo_boxes_np, yolo_scores_np, yolo_cls_np, yolo_dists)
+
+        # ==== OBS TRACK (giữ nguyên) ====
         D = torch.from_numpy(depth_m_enh).to(device=device, dtype=torch.float32)
         Dl = torch.log(torch.clamp(D, min=1e-3))
         from src.utils.torch_cuda import sobel_grad
         gx, gy = sobel_grad(Dl)
         def _refine(bx_np):
             return refine_box_by_edges_and_height(bx_np, gx, gy, height_t, eocfg)
-
         obs_tracks  = tracker_o.update(boxes, scores, dists, _refine, (W,H), edge_ok_final)
 
         # ==== VIZ ====
         draw_boxes_arr, draw_dists_arr, labels = [], [], []
-        for tid, tb, ts, tc, tz, is_pred in y_tracks:
-            draw_boxes_arr.append(tb); draw_dists_arr.append(tz if np.isfinite(tz) else np.nan)
-            labels.append(str(int(tc)))
+
+        # YOLO: name tag + màu theo khoảng cách (giống OBS)
+        if len(y_tracks):
+            for tid, tb, ts, tc, tz, is_pred in y_tracks:
+                draw_boxes_arr.append(tb)
+                draw_dists_arr.append(tz if np.isfinite(tz) else np.nan)
+                # tên lớp: ưu tiên map từ model, fallback id
+                cname = det.names.get(int(tc), str(int(tc))) if hasattr(det, "names") else str(int(tc))
+                labels.append(cname)
+
+        # OBS giữ nguyên
         if len(obs_tracks):
             for tid, tb, ts, tc, tz, is_pred in obs_tracks:
-                draw_boxes_arr.append(tb); draw_dists_arr.append(tz if np.isfinite(tz) else np.nan)
+                draw_boxes_arr.append(tb)
+                draw_dists_arr.append(tz if np.isfinite(tz) else np.nan)
                 labels.append("OBS")
 
         draw_boxes_arr = np.asarray(draw_boxes_arr, dtype=np.float32) if len(draw_boxes_arr) else np.zeros((0,4), dtype=np.float32)
@@ -211,7 +223,7 @@ def process_video(src_path: str, out_path: str, cfg: dict):
 
         vis = draw_boxes(rgb, draw_boxes_arr, labels, draw_dists_arr, thr=(thr_low,thr_high),
                          thickness=cfg["viz"]["thickness"], font_scale=cfg["viz"]["font_scale"])
-        hud = [f"OBS:epp={e_boxes.shape[0]} ppp={p_boxes.shape[0]} out={len(obs_tracks)}  YOLO:{yb.shape[0]} trk={len(y_tracks)}  alpha={alpha:.3f}"]
+        hud = [f"OBS:epp={e_boxes.shape[0]} ppp={p_boxes.shape[0]} out={len(obs_tracks)}  YOLO:{yolo_boxes_np.shape[0]} trk={len(y_tracks)}  alpha={alpha:.3f}"]
         vis = draw_hud(vis, hud)
         vis = cv2.resize(vis, (outW,outH), interpolation=cv2.INTER_AREA)
         writer.write_rgb(vis)

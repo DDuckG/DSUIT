@@ -7,7 +7,7 @@ io:
   warmup_iters: 12
 
 camera:
-  height_m: 1.35
+  height_m: 0.77
   fov_deg_h: 68.0
   principal: [0.5, 0.5]
 
@@ -126,10 +126,10 @@ fusion:
 
   plane_fit:
     method: ransac
-    inlier_thr_m: 0.05
+    inlier_thr_m: 0.07
     max_iter: 180
     sample_stride: 4
-    ema_beta: 0.9
+    ema_beta: 0.95
     use_sidewalk: true
     use_terrain: true
 
@@ -185,6 +185,10 @@ fusion:
     z_max_keep_m: 80.0
 
   z_max_obs_m: 15.0
+
+  depth_calib:
+    gamma: 0.85    # 0.8–0.9 để nén mạnh phần xa
+    scale: 0.815   # tính theo công thức ở trên để “neo” đúng mốc gần
 
 viz:
   thickness: 2

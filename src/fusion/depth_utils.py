@@ -32,7 +32,7 @@ def distance_from_box(depth_m, height_m, seg, box_xyxy, foot_h=0.06, frac=0.25):
     mfoot = (hr <= float(foot_h)) & (sr != ROAD_ID)
     z_band = rb[mfoot]
     if z_band.size >= 20:
-        return float(np.percentile(z_band, 20.0))
+        return float(np.percentile(z_band, 15.0))
     roi = depth_m[y1:y2, x1:x2]
     mask = np.isfinite(roi) & (roi>0) & (seg[y1:y2, x1:x2] != SKY_ID)
-    return float(np.percentile(roi[mask], 35.0))
+    return float(np.percentile(roi[mask], 30.0))
