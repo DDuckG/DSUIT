@@ -12,7 +12,10 @@ class FramePacket:
 
 class AsyncVideoReader:
     def __init__(self, path: str, prefetch: int = 8):
+        self.path = path
         self.cap = cv2.VideoCapture(path)
+        if not self.cap.isOpened():
+            print(f"[READ] cannot open video: {path}")
         self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
         self.W = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.H = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -23,11 +26,17 @@ class AsyncVideoReader:
 
     def _worker(self):
         fid = 0
+        first = True
         while not self._stop:
             ok, bgr = self.cap.read()
             if not ok:
+                if first:
+                    print(f"[READ] no frames from {self.path}")
+                else:
+                    print(f"[READ] end of stream after {fid} frames")
                 self.q.put(None)
                 break
+            first = False
             fid += 1
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             pkt = FramePacket(frame_id = fid, rgb = rgb, H = self.H, W = self.W, ts = fid/self.fps)

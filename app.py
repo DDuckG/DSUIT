@@ -1,10 +1,3 @@
-# app.py
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-FULLUS — Desktop UI (16:9) at http://127.0.0.1:8888
-(đã rút gọn mô tả)
-"""
 import os
 import sys
 import shutil
@@ -15,47 +8,37 @@ from collections import deque
 from datetime import datetime
 from queue import Queue, Empty
 from flask import Flask, request, send_from_directory, Response, jsonify, render_template_string, abort
-
-try:
-    from werkzeug.utils import secure_filename
-except Exception:
-    def secure_filename(name):
-        return ''.join(c for c in name if c.isalnum() or c in (' ','-','_','.')).strip().replace(' ','_')
-
-try:
-    import yaml
-except Exception:
-    yaml = None
+from werkzeug.utils import secure_filename
+import yaml
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data", "raw_videos")
-OUT_DIR  = os.path.join(BASE_DIR, "outputs")
+OUT_DIR = os.path.join(BASE_DIR, "outputs")
 CONF_DIR = os.path.join(BASE_DIR, "configs")
-STATIC_DIR = os.path.join(BASE_DIR, "static")
-for p in (DATA_DIR, OUT_DIR, CONF_DIR, STATIC_DIR, os.path.join(STATIC_DIR, "snd")):
-    os.makedirs(p, exist_ok=True)
+ASSETS_DIR = os.path.join(BASE_DIR, "assets")
+for p in (DATA_DIR, OUT_DIR, CONF_DIR, ASSETS_DIR):
+    os.makedirs(p, exist_ok = True)
 
 DEFAULT_CONFIG = os.path.join(CONF_DIR, "config.yaml")
 
-# Bật static để phục vụ mp3: /static/...
-app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="/static")
-LOGS = deque(maxlen=5000)
+app = Flask(__name__)
+LOGS = deque(maxlen = 5000)
 CLIENTS: list[Queue] = []
-JOBS: dict[str, dict] = {}   # {"a1.mp4": {"ready": bool, "output_url": str, "web_url": Optional[str], "events_url": Optional[str]}}
+JOBS: dict[str, dict] = {}
 
 def log(msg: str):
     line = f"{datetime.now().strftime('%H:%M:%S')}  {msg}"
     LOGS.append(line)
     for q in list(CLIENTS):
-        try: q.put_nowait(line)
-        except Exception: pass
+        q.put_nowait(line)
+
 
 def write_runtime_config(base_cfg_path, fps, width, height, cam_h, sound_on):
-    os.makedirs(os.path.join(BASE_DIR, "runtime_configs"), exist_ok=True)
+    os.makedirs(os.path.join(BASE_DIR, "runtime_configs"), exist_ok = True)
     out_path = os.path.join(BASE_DIR, "runtime_configs", f"run_{int(time.time())}.yaml")
     if yaml is not None:
         try:
-            with open(base_cfg_path, "r", encoding="utf-8") as f:
+            with open(base_cfg_path, "r", encoding = "utf-8") as f:
                 base = yaml.safe_load(f) or {}
         except Exception:
             base = {}
@@ -66,7 +49,7 @@ def write_runtime_config(base_cfg_path, fps, width, height, cam_h, sound_on):
         base["io"]["output_size"] = [int(width), int(height)]
         base["camera"]["height_m"] = float(cam_h)
         base["audio"]["enabled"] = bool(sound_on)
-        with open(out_path, "w", encoding="utf-8") as f:
+        with open(out_path, "w", encoding = "utf-8") as f:
             yaml.safe_dump(base, f, sort_keys=False)
     else:
         cfg_txt = (
@@ -81,23 +64,9 @@ def write_runtime_config(base_cfg_path, fps, width, height, cam_h, sound_on):
 def transcode_to_web_safe(src_mp4: str) -> tuple[bool, str]:
     ffmpeg = shutil.which("ffmpeg")
     web_path = os.path.splitext(src_mp4)[0] + "_web.mp4"
-
-    # Sanity checks
-    if not os.path.exists(src_mp4):
-        log(f"[UI] transcode skipped: input not found: {src_mp4}")
-        return False, web_path
-    try:
-        size = os.path.getsize(src_mp4)
-    except Exception:
-        size = 0
-    if size <= 0:
-        log(f"[UI] transcode skipped: input is empty: {src_mp4}")
-        return False, web_path
-
     if not ffmpeg:
         log("[UI] ffmpeg not found; serving original file (codec may be unsupported).")
         return False, web_path
-
     try:
         cmd = [
             ffmpeg, "-y", "-i", src_mp4,
@@ -118,7 +87,6 @@ def transcode_to_web_safe(src_mp4: str) -> tuple[bool, str]:
             for q in list(CLIENTS):
                 try: q.put_nowait(ln)
                 except Exception: pass
-
         if proc.returncode == 0 and os.path.exists(web_path) and os.path.getsize(web_path) > 0:
             log(f"[UI] Transcoded to web-safe: {web_path}")
             return True, web_path
@@ -128,39 +96,17 @@ def transcode_to_web_safe(src_mp4: str) -> tuple[bool, str]:
     except Exception as e:
         log(f"[UI] ffmpeg error: {e}")
         return False, web_path
-    
-def _wait_for_file_ready(path: str, timeout_sec: float = 3.0, min_size: int = 8_192) -> bool:
-    """
-    Wait (briefly) until `path` exists and is at least `min_size` bytes.
-    Returns True if ready, False if timed out.
-    """
-    t0 = time.time()
-    last_size = -1
-    while time.time() - t0 < timeout_sec:
-        if os.path.exists(path):
-            try:
-                sz = os.path.getsize(path)
-            except Exception:
-                sz = 0
-            if sz >= min_size:
-                return True
-            # If size is growing, small sleep and keep waiting
-            if sz != last_size:
-                last_size = sz
-        time.sleep(0.12)
-    return os.path.exists(path) and os.path.getsize(path) >= min_size
 
-
-def run_pipeline_async(job_name: str, src_path: str, out_path: str, cfg_path: str):
+def run_pipeline_async(job_name: str, src_path: str, out_video_path: str, cfg_path: str):
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
-    cmd = [sys.executable, "-u", "-m", "src.main", "--src", src_path, "--out", out_path, "--config", cfg_path]
+    cmd = [sys.executable, "-u", "-m", "src.main", "--src", src_path, "--out", out_video_path, "--config", cfg_path]
     log("cmd: " + " ".join(cmd))
     try:
+        rc = 255
         with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1, text=True, env=env) as p:
             for line in p.stdout:
-                if not line: 
-                    continue
+                if not line: continue
                 line = line.rstrip("\n")
                 LOGS.append(line)
                 for q in list(CLIENTS):
@@ -168,44 +114,49 @@ def run_pipeline_async(job_name: str, src_path: str, out_path: str, cfg_path: st
                     except Exception: pass
             rc = p.wait()
 
-        if rc == 0:
-            # Double-check the output file actually exists and has non-trivial size
-            if not _wait_for_file_ready(out_path, timeout_sec=3.0, min_size=8_192):
-                log(f"[UI] ERROR: pipeline returned rc=0 but output not found or empty: {out_path}")
-                try:
-                    # Helpful diagnostics
-                    out_dir = os.path.dirname(out_path) or "."
-                    listing = ", ".join(os.listdir(out_dir))
-                    log(f"[UI] outputs dir listing: {out_dir}: {listing}")
-                except Exception as e:
-                    log(f"[UI] could not list outputs dir: {e}")
-                JOBS.setdefault(job_name, {}).update({"ready": False})
-                return
+        folder = os.path.dirname(out_video_path)
+        base = os.path.splitext(os.path.basename(out_video_path))[0]
+        alerts_path = os.path.join(folder, f"{base}_alerts.json")
 
-            JOBS.setdefault(job_name, {}).update({"ready": True})
-            log(f"OUTPUT_READY {out_path}")
-
-            ok, web_path = transcode_to_web_safe(out_path)
+        if rc == 0 and os.path.exists(out_video_path) and os.path.getsize(out_video_path) > 0:
+            JOBS.setdefault(job_name, {}).update({
+                "ready": True, "folder": folder,
+                "video": f"/video/output/{job_name}/{os.path.basename(out_video_path)}",
+                "alerts": (f"/video/output/{job_name}/{os.path.basename(alerts_path)}" if os.path.exists(alerts_path) else None),
+                "video_web": None
+            })
+            log(f"OUTPUT_READY {out_video_path}")
+            ok, web_path = transcode_to_web_safe(out_video_path)
             if ok:
-                rel = os.path.basename(web_path)
-                JOBS[job_name]["web_url"] = f"/video/output_web/{rel}"
+                JOBS[job_name]["video_web"] = f"/video/output_web/{job_name}/{os.path.basename(web_path)}"
                 log(f"OUTPUT_READY_WEB {web_path}")
-            else:
-                JOBS[job_name]["web_url"] = None
         else:
-            log(f"ERROR pipeline returned code {rc}")
-            JOBS.setdefault(job_name, {}).update({"ready": False})
-
+            if rc == 0:
+                log(f"[UI] ERROR: pipeline returned rc=0 but output not found or empty: {out_video_path}")
+                try:
+                    listing = ", ".join(sorted(os.listdir(folder)))
+                    log(f"[UI] outputs dir listing: {folder}: {listing}")
+                except Exception:
+                    pass
+            JOBS.setdefault(job_name, {}).update({"ready": False, "folder": folder})
     except FileNotFoundError:
         log("ERROR: Could not launch 'python -m src.main'. Ensure your environment is set up.")
         JOBS.setdefault(job_name, {}).update({"ready": False})
     except Exception as e:
         log(f"ERROR: {e}")
         JOBS.setdefault(job_name, {}).update({"ready": False})
-        
+
 @app.route("/")
 def index():
     return render_template_string(INDEX_HTML, default_fps=30, default_w=1280, default_h=720, default_cam_h=1.35)
+
+@app.route("/assets/<path:subpath>")
+def assets(subpath):
+    full = os.path.join(ASSETS_DIR, subpath)
+    if not os.path.isfile(full): abort(404)
+    resp = send_from_directory(ASSETS_DIR, subpath, as_attachment=False)
+    resp.headers["Accept-Ranges"] = "bytes"
+    return resp
 
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -217,48 +168,64 @@ def upload():
     sound_on = request.form.get("sound_on", "true").lower() == "true"
     base_cfg = request.form.get("config", DEFAULT_CONFIG)
 
-    if not file or file.filename == "": return jsonify({"ok": False, "error": "No file provided."}), 400
+    if not file or file.filename == "": 
+        return jsonify({"ok": False, "error": "No file provided."}), 400
     name = secure_filename(file.filename)
-    if not name.lower().endswith(".mp4"): return jsonify({"ok": False, "error": "Only .mp4 files are accepted."}), 400
+    if not name.lower().endswith(".mp4"): 
+        return jsonify({"ok": False, "error": "Only .mp4 files are accepted."}), 400
 
     in_path = os.path.join(DATA_DIR, name)
-    out_path = os.path.join(OUT_DIR, name)
     os.makedirs(os.path.dirname(in_path), exist_ok=True)
     file.save(in_path)
     log(f"[UI] received file -> {in_path}")
     log(f"[UI] sound={'on' if sound_on else 'off'} fps={fps} size={width}x{height} cam_h={cam_h}")
 
-    JOBS[name] = {"ready": False, "output_url": f"/video/output/{name}", "web_url": None, "events_url": None}
+    stem = os.path.splitext(name)[0]
+    job_folder = os.path.join(OUT_DIR, stem)
+    os.makedirs(job_folder, exist_ok=True)
+    out_path = os.path.join(job_folder, f"{stem}.mp4")
+
+    JOBS[stem] = {"ready": False, "folder": job_folder,
+                  "video": f"/video/output/{stem}/{stem}.mp4",
+                  "video_web": None,
+                  "alerts": f"/video/output/{stem}/{stem}_alerts.json"}
     cfg_path = write_runtime_config(base_cfg, fps, width, height, cam_h, sound_on)
-    threading.Thread(target=run_pipeline_async, args=(name, in_path, out_path, cfg_path), daemon=True).start()
-    return jsonify({"ok": True, "job": name, "input_url": f"/video/input/{name}", "output_url": JOBS[name]["output_url"]})
+    threading.Thread(target=run_pipeline_async, args=(stem, in_path, out_path, cfg_path), daemon=True).start()
+
+    return jsonify({"ok": True, "job": stem,
+                    "input_url": f"/video/input/{name}",
+                    "status_url": f"/status/{stem}"})
 
 @app.route("/status/<job>")
 def job_status(job: str):
     info = JOBS.get(job)
-    if not info: return jsonify({"exists": False, "ready": False})
+    if not info: 
+        return jsonify({"exists": False, "ready": False})
     return jsonify({
-        "exists": True,
-        "ready": bool(info.get("ready", False)),
-        "output_url": info.get("output_url"),
-        "web_url": info.get("web_url"),
-        "events_url": info.get("events_url"),
+        "exists": True, "ready": bool(info.get("ready", False)),
+        "video_url": info.get("video"),
+        "video_web_url": info.get("video_web"),
+        "alerts_url": info.get("alerts"),
+        "folder": info.get("folder"),
     })
 
 @app.route("/video/input/<path:fname>")
-def video_input(fname): return send_from_directory(DATA_DIR, fname, as_attachment=False)
+def video_input(fname): 
+    return send_from_directory(DATA_DIR, fname, as_attachment=False)
 
-@app.route("/video/output/<path:fname>")
-def video_output(fname):
-    full = os.path.join(OUT_DIR, fname)
+@app.route("/video/output/<job>/<path:fname>")
+def video_output(job, fname):
+    folder = os.path.join(OUT_DIR, job)
+    full = os.path.join(folder, fname)
     if not os.path.exists(full): abort(404)
-    return send_from_directory(OUT_DIR, fname, as_attachment=False)
+    return send_from_directory(folder, fname, as_attachment=False)
 
-@app.route("/video/output_web/<path:fname>")
-def video_output_web(fname):
-    full = os.path.join(OUT_DIR, fname)
+@app.route("/video/output_web/<job>/<path:fname>")
+def video_output_web(job, fname):
+    folder = os.path.join(OUT_DIR, job)
+    full = os.path.join(folder, fname)
     if not os.path.exists(full): abort(404)
-    return send_from_directory(OUT_DIR, fname, as_attachment=False)
+    return send_from_directory(folder, fname, as_attachment=False)
 
 @app.route("/logs")
 def sse_logs():
@@ -305,14 +272,38 @@ INDEX_HTML = r"""
   header .subtitle{ margin-top: 6px; font-family: Poppins, system-ui, sans-serif; font-weight: 500; letter-spacing: 1px; font-size: 22px; }
   .grid{ display:grid; grid-template-columns: repeat(12, 1fr); gap: var(--gutter);}
   .card{ background: var(--card); border: var(--thin) solid var(--border); border-radius: var(--radius); box-shadow: 0 10px 30px rgba(28,49,74,0.08); }
+
   .video-card{ position: relative; padding: 16px; }
   .video-inner{ position: relative; width: 100%; aspect-ratio: 16/9; border-radius: 18px; border: var(--thin) solid #BECDDA; overflow: hidden; background: #000; }
-  .video-inner.mint{ background: #000; }
-  .video-label{ position:absolute; left: 24px; bottom: 20px; font-weight: 700; font-size: 20px; color:#a9b7c6;}
+
+  /* --- Upload Placeholder --- */
+  .upload-placeholder{
+    position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:16px; background: #EDF2F8; color:#6E86A6; text-align:center; user-select:none; cursor:pointer;
+  }
+  .upload-placeholder .icon{ width: 108px; height:108px; opacity:0.8; }
+  .upload-placeholder .hint{ font-weight:800; font-size:22px; }
+
+  /* hide video until set */
+  #uploadVideo{ display:none; width:100%; height:100%; object-fit:cover; background:#000; }
+  /* shown after file chosen */
+  .has-upload #uploadVideo{ display:block; }
+  .has-upload .upload-placeholder{ display:none; }
+
   .video-inner video{ width:100%; height:100%; object-fit: cover; display:block; background:#000; }
-  #uploadArea{ cursor: pointer; }
-  #outputArea video{ pointer-events: none; }
-  #outputArea{ cursor: not-allowed; }
+
+  .video-label{ position:absolute; left: 24px; bottom: 20px; font-weight: 700; font-size: 20px; color:#a9b7c6;}
+
+  /* Clear button “trồi ra ngoài” */
+  .clear-btn{
+    position:absolute; top:-12px; left:-22px; width:56px; height:56px; border-radius:16px;
+    background:#fff; border:2px solid var(--border); box-shadow:0 8px 24px rgba(28,49,74,.15);
+    display:none; align-items:center; justify-content:center; cursor:pointer;
+  }
+  .clear-btn img{ width:28px; height:28px; }
+  .has-upload + .clear-btn{ display:flex; }
+
+  /* Output area controls */
   .ready-overlay{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; pointer-events:auto; }
   .ready-overlay.hidden{ display:none; }
   .bigplay{ width: 96px; height: 96px; border-radius: 999px; background: #ffffffcc; border: 1px solid var(--border); display:flex; align-items:center; justify-content:center; box-shadow: 0 12px 30px rgba(28,49,74,.18); cursor: pointer; font-weight: 800; }
@@ -320,18 +311,23 @@ INDEX_HTML = r"""
   .output-ctl{ position:absolute; right:16px; top:16px; display:flex; gap:8px; pointer-events:auto; }
   .btn{ appearance:none; border:1px solid var(--border); background:#F5F8FD; padding:8px 12px; border-radius:12px; font-weight:700; color:var(--ink); cursor:pointer; box-shadow: 0 2px 8px rgba(28,49,74,.06); }
   .btn:active{ transform: translateY(1px); }
+
+  /* Sidebar */
   .parameters.card{ padding: 20px; }
   .pill-row{ display:flex; gap:12px; margin: 12px 0 6px 0; flex-wrap:wrap; }
   .pill{ display:flex; align-items:center; gap:12px; padding: 12px 14px; border:1px solid var(--border); border-radius:14px; background:#F5F8FD; }
   .pill input{ width: 72px; padding:8px 10px; border:1px solid var(--border); border-radius:10px; font-weight:600; color:var(--ink); background:#fff; }
   .pill .w{ width: 88px; } .pill .h{ width: 88px; }
+
   .toggle.card{ padding: 20px;}
   .toggle-row{ display:flex; align-items:center; justify-content:space-between; gap:16px; }
   .switch{ position:relative; width: 86px; height: 44px; background:#D2DCE8; border-radius: 22px; transition: all .18s ease; border: 1px solid var(--border); }
   .switch .knob{ position:absolute; top:3px; left:3px; width:38px; height:38px; background:#fff; border-radius: 50%; transition: all .18s ease; box-shadow: 0 2px 4px rgba(0,0,0,.15); }
   .switch.on{ background:#A8E6CF; } .switch.on .knob{ left: 45px; }
+
   .log.card{ padding: 20px; background: #F6F6FA; }
   #logbox{ height: 220px; overflow:auto; font-family: ui-monospace, SFMono, Menlo, Consolas, monospace; font-size: 13px; }
+
   #leftCol{ grid-column: span 8; } #rightCol{ grid-column: span 4; }
   @media (max-width: 1200px){ #leftCol{ grid-column: span 12; } #rightCol{ grid-column: span 12; } }
 </style>
@@ -344,15 +340,25 @@ INDEX_HTML = r"""
     </header>
     <main class="grid">
       <section id="leftCol">
+        <!-- Upload card -->
         <div id="uploadArea" class="card video-card">
-          <div class="video-inner" id="uploadInner">
+          <div id="uploadInner" class="video-inner">
+            <div id="uploadPlaceholder" class="upload-placeholder" role="button" tabindex="0" aria-label="Upload a .mp4">
+              <img class="icon" alt="upload" src="/assets/svg/upload.svg"/>
+              <div class="hint">Click to upload .mp4</div>
+            </div>
             <video id="uploadVideo" controls muted playsinline></video>
+          </div>
+          <div id="clearBtn" class="clear-btn" title="Clear & reset">
+            <img src="/assets/svg/red_x.svg" alt="clear"/>
           </div>
           <div class="video-label">upload</div>
           <input id="fileInput" type="file" accept="video/mp4" style="display:none"/>
         </div>
+
+        <!-- Output card -->
         <div id="outputArea" class="card video-card" style="margin-top: 24px">
-          <div class="video-inner mint">
+          <div class="video-inner">
             <video id="outputVideo" preload="auto" playsinline muted></video>
             <div id="readyOverlay" class="ready-overlay hidden">
               <div id="bigPlay" class="bigplay" title="Play">▶</div>
@@ -365,6 +371,7 @@ INDEX_HTML = r"""
           <div class="video-label">output</div>
         </div>
       </section>
+
       <aside id="rightCol" class="grid" style="grid-template-columns: 1fr; gap: 24px">
         <div class="parameters card">
           <div style="font-weight:800; font-size:22px; margin-bottom:4px">Parameters</div>
@@ -374,134 +381,86 @@ INDEX_HTML = r"""
             <div class="pill">camera height <input id="cam_h" type="number" step="0.01" value="{{ default_cam_h }}"/></div>
           </div>
         </div>
+
         <div class="toggle card">
           <div class="toggle-row">
             <div style="font-weight:800; font-size:22px;">Sound</div>
-            <div id="soundSwitch" class="switch on" role="switch" aria-checked="true" tabindex="0" onclick="toggleSound()"><div class="knob"></div></div>
+            <div id="soundSwitch" class="switch on" role="switch" aria-checked="true" tabindex="0"><div class="knob"></div></div>
           </div>
           <div style="color:#506483; margin-top:8px">Toggle warning sound</div>
         </div>
+
         <div class="log card">
-          <div style="font-weight:800; font-size:22px; margin-bottom:6px">log</div>
+          <div style="font-weight:800; font-size:22px; margin-bottom:6px">Log</div>
           <div id="logbox"></div>
         </div>
       </aside>
     </main>
   </div>
-<script>
-  // --- Sound toggle ---
-  let SOUND_ON = true;
-  function toggleSound(){ SOUND_ON=!SOUND_ON; const el=document.getElementById('soundSwitch'); el.classList.toggle('on',SOUND_ON); el.setAttribute('aria-checked',SOUND_ON?'true':'false'); }
 
+<script>
+  // --- State ---
+  let SOUND_ON = true;
+  let activeJob = null;
+  let CANCEL_TOKEN = {cancel:false};
+  let uploadObjectURL = null;
+  let OUTPUT_URL=null, WEB_URL=null, ALERTS_URL=null, CURRENT_SRC=null, ATTACHED=false;
+
+  // --- Elements ---
   const uploadArea=document.getElementById('uploadArea');
-  const fileInput=document.getElementById('fileInput');
+  const uploadInner=document.getElementById('uploadInner');
+  const uploadPlaceholder=document.getElementById('uploadPlaceholder');
   const uploadVideo=document.getElementById('uploadVideo');
+  const clearBtn=document.getElementById('clearBtn');
+
+  const fileInput=document.getElementById('fileInput');
   const outputVideo=document.getElementById('outputVideo');
   const logbox=document.getElementById('logbox');
   const playBtn=document.getElementById('playBtn');
   const pauseBtn=document.getElementById('pauseBtn');
   const readyOverlay=document.getElementById('readyOverlay');
   const bigPlay=document.getElementById('bigPlay');
+  const soundSwitch=document.getElementById('soundSwitch');
 
-  // Track current URLs to switch/fallback on error
-  let OUTPUT_URL=null, WEB_URL=null, CURRENT_SRC=null, ATTACHED=false;
+  // --- Audio ---
+  let audioYellow = new Audio('/assets/audio/be_careful.mp3');
+  let audioRed = new Audio('/assets/audio/danger.mp3');
+  audioYellow.preload = 'auto'; audioRed.preload = 'auto';
 
-  // --- Alert events ---
-  let EVENTS=[];      // {t, level, message}
-  let EV_IDX=0;
-  let EVENTS_URL=null;
-
-  // Preload audio
-  const warnAudio = new Audio('/static/snd/canthan.mp3');
-  const dangerAudio = new Audio('/static/snd/nguyhiem.mp3');
-
-  uploadArea.addEventListener('click', ()=>fileInput.click());
-
-  fileInput.addEventListener('change', async (ev)=>{
-    const f=ev.target.files[0]; if(!f) return;
-    if(!f.name.toLowerCase().endsWith('.mp4')){ alert('Only .mp4 files are accepted'); return; }
-    const url=URL.createObjectURL(f); uploadVideo.src=url; uploadVideo.play().catch(()=>{});
-    const fd=new FormData();
-    fd.append('file', f);
-    fd.append('fps', document.getElementById('fps').value||30);
-    fd.append('width', document.getElementById('width').value||1280);
-    fd.append('height', document.getElementById('height').value||720);
-    fd.append('cam_h', document.getElementById('cam_h').value||1.35);
-    fd.append('sound_on', SOUND_ON?'true':'false');
-    const r=await fetch('/upload',{method:'POST',body:fd});
-    const j=await r.json();
-    if(!j.ok){ alert('Upload failed: '+(j.error||'unknown')); return; }
-    window.__job=j.job; OUTPUT_URL=j.output_url; WEB_URL=null; EVENTS_URL=null; EVENTS=[]; EV_IDX=0; ATTACHED=false;
-    pollJobUntilReady(j.job);
-  });
-
-  // --- Logs via SSE ---
-  function appendLog(line){
-    const pre=document.createElement('div'); pre.textContent=line; logbox.appendChild(pre);
+  function logLine(s){
+    const pre=document.createElement('div'); pre.textContent=s; logbox.appendChild(pre);
     logbox.scrollTop=logbox.scrollHeight;
-
-    // Prefer web-ready signal
-    if(line.startsWith('OUTPUT_READY_WEB')){
-      if(window.__job){ fetch('/status/'+encodeURIComponent(window.__job)).then(r=>r.json()).then(s=>{
-        if(s.web_url){ WEB_URL=s.web_url; tryAttachPreferWeb(); }
-      }); }
-      return;
-    }
-    if(line.startsWith('OUTPUT_READY ')){
-      setTimeout(()=>{ if(!ATTACHED) tryAttachPreferWeb(true); }, 3000);
-    }
-    if(line.startsWith('ALERTS_READY ')){
-      if(window.__job){ fetch('/status/'+encodeURIComponent(window.__job)).then(r=>r.json()).then(s=>{
-        if(s.events_url){ EVENTS_URL=s.events_url; fetchEvents(); }
-      }); }
-    }
-  }
-  try{ const es=new EventSource('/logs'); es.onmessage=(e)=>appendLog(e.data); }catch(e){ console.warn('SSE failed',e); }
-
-  // --- Status poller ---
-  async function pollJobUntilReady(job){
-    let seenReady=false, waited=0;
-    while(true){
-      const r=await fetch('/status/'+encodeURIComponent(job));
-      if(!r.ok) break;
-      const s=await r.json();
-      if(s.exists && s.ready){
-        seenReady=true;
-        if(s.events_url && !EVENTS_URL){ EVENTS_URL=s.events_url; fetchEvents(); }
-        if(s.web_url){ WEB_URL=s.web_url; tryAttachPreferWeb(); return; }
-        OUTPUT_URL=s.output_url || OUTPUT_URL;
-        waited+=2;
-        if(waited>=10){ tryAttachPreferWeb(true); return; }
-      }
-      await new Promise(res=>setTimeout(res, 2000));
-    }
   }
 
-  async function fetchEvents(){
-    try{
-      const r=await fetch(EVENTS_URL+'?v='+Date.now());
-      if(!r.ok) return;
-      const j=await r.json();
-      EVENTS = Array.isArray(j.events) ? j.events.slice().sort((a,b)=>a.t-b.t) : [];
-      EV_IDX=0;
-      // Log meta
-      if(j.meta){
-        appendLog('[ALERTS] loaded: events='+EVENTS.length+' roi=['+(j.meta.roi_frac||[]).join(',')+']');
-      }else{
-        appendLog('[ALERTS] loaded: events='+EVENTS.length);
-      }
-    }catch(e){ console.warn('fetch events error',e); }
+  // --- UI helpers ---
+  function setUploadHasVideo(has){
+    uploadInner.classList.toggle('has-upload', !!has);
   }
 
-  function urlWithBust(u){ if(!u) return u; const v=Date.now(); return u+(u.includes('?')?'&':'?')+'v='+v; }
+  function resetUpload(){
+    CANCEL_TOKEN.cancel = true;  // stop poller
+    activeJob = null;
+    OUTPUT_URL = WEB_URL = ALERTS_URL = CURRENT_SRC = null; ATTACHED = false;
 
-  function hardAttach(url){
+    // stop & clear videos
+    try{ uploadVideo.pause(); }catch(e){}
+    try{ outputVideo.pause(); }catch(e){}
+    try{ outputVideo.removeAttribute('src'); outputVideo.load(); }catch(e){}
+    if(uploadObjectURL){ URL.revokeObjectURL(uploadObjectURL); uploadObjectURL=null; }
+    uploadVideo.removeAttribute('src'); uploadVideo.load();
+
+    setUploadHasVideo(false);
+    readyOverlay.classList.remove('hidden');
+    logLine('[UI] reset upload');
+  }
+
+  function attachOutput(url){
     if(!url) return;
     ATTACHED=true; CURRENT_SRC=url;
     outputVideo.pause();
     outputVideo.removeAttribute('src');
     outputVideo.load();
-    outputVideo.src=urlWithBust(url);
+    outputVideo.src=url + (url.includes('?')?'&':'?') + 'v=' + Date.now();
     outputVideo.load();
 
     readyOverlay.classList.remove('hidden');
@@ -513,51 +472,120 @@ INDEX_HTML = r"""
     outputVideo.addEventListener('play', onPlay, {once:true});
   }
 
-  function tryAttachPreferWeb(allowFallback=false){
-    if(WEB_URL){ hardAttach(WEB_URL); return; }
-    if(allowFallback && OUTPUT_URL){ hardAttach(OUTPUT_URL); }
-  }
+  // --- Upload interactions ---
+  uploadPlaceholder.addEventListener('click', ()=>fileInput.click());
+  uploadPlaceholder.addEventListener('keypress', (e)=>{ if(e.key==='Enter') fileInput.click(); });
+  clearBtn.addEventListener('click', resetUpload);
 
-  // Fallback when <video> fires error
-  outputVideo.addEventListener('error', ()=>{
-    const msg=document.createElement('div'); msg.textContent='[UI] video element error'; logbox.appendChild(msg);
-    if(CURRENT_SRC && WEB_URL && CURRENT_SRC!==WEB_URL){ hardAttach(WEB_URL); return; }
-    if(CURRENT_SRC && OUTPUT_URL && CURRENT_SRC!==OUTPUT_URL){ hardAttach(OUTPUT_URL); return; }
+  fileInput.addEventListener('change', async (ev)=>{
+    const f=ev.target.files[0]; if(!f) return;
+    if(!f.name.toLowerCase().endsWith('.mp4')){ alert('Only .mp4 files are accepted'); return; }
+    if(uploadObjectURL){ URL.revokeObjectURL(uploadObjectURL); }
+    uploadObjectURL = URL.createObjectURL(f);
+    uploadVideo.src = uploadObjectURL;
+    setUploadHasVideo(true);
+    try{ await uploadVideo.play(); }catch(_){}
+
+    // prepare form
+    const fd=new FormData();
+    fd.append('file', f);
+    fd.append('fps', document.getElementById('fps').value||30);
+    fd.append('width', document.getElementById('width').value||1280);
+    fd.append('height', document.getElementById('height').value||720);
+    fd.append('cam_h', document.getElementById('cam_h').value||1.35);
+    fd.append('sound_on', SOUND_ON?'true':'false');
+
+    CANCEL_TOKEN = {cancel:false};
+    const r=await fetch('/upload',{method:'POST',body:fd});
+    const j=await r.json();
+    if(!j.ok){ alert('Upload failed: '+(j.error||'unknown')); resetUpload(); return; }
+    activeJob=j.job; OUTPUT_URL=null; WEB_URL=null; ALERTS_URL=null; ATTACHED=false;
+    pollJobUntilReady(j.status_url, CANCEL_TOKEN);
   });
 
-  // External controls
-  document.getElementById('playBtn').addEventListener('click', ()=>{ outputVideo.play().catch(()=>{}); });
-  document.getElementById('pauseBtn').addEventListener('click', ()=>{ try{ outputVideo.pause(); }catch(e){} });
-  document.getElementById('bigPlay').addEventListener('click', ()=>{ outputVideo.play().catch(()=>{}); });
+  // --- Poll status & attach output + alerts ---
+  async function pollJobUntilReady(statusUrl, token){
+    let waited=0;
+    while(!token.cancel){
+      const r=await fetch(statusUrl);
+      if(!r.ok) break;
+      const s=await r.json();
+      if(s.exists && s.ready){
+        if(s.video_web_url){ WEB_URL=s.video_web_url; }
+        OUTPUT_URL = s.video_url || OUTPUT_URL;
+        ALERTS_URL = s.alerts_url || ALERTS_URL;
 
-  // === Phát cảnh báo đúng mốc thời gian (từ alerts.json) ===
-  const EPS = 0.05;
+        // attach video
+        if(WEB_URL){ attachOutput(WEB_URL); } else if(OUTPUT_URL){ attachOutput(OUTPUT_URL); }
+
+        // fetch alerts (once)
+        if(ALERTS_URL){ fetchAlerts(ALERTS_URL); }
+        return;
+      }
+      await new Promise(res=>setTimeout(res, 1200));
+      waited+=1;
+    }
+  }
+
+  // Alerts schedule & playback
+  let schedule = [];
+  let nextIdx = 0;
+  function clearSchedule(){ schedule=[]; nextIdx=0; }
+  function fetchAlerts(url){
+    logLine('[UI] fetching alerts: '+url);
+    fetch(url).then(r=>{
+      if(!r.ok) throw new Error('HTTP '+r.status+' for '+url);
+      return r.json();
+    }).then(js=>{
+      schedule = (Array.isArray(js)?js:[]);
+      schedule.sort((a,b)=>(a.t||0)-(b.t||0));
+      nextIdx = 0;
+      logLine('[UI] loaded '+schedule.length+' alerts from '+url);
+    }).catch(e=>{
+      logLine('[UI] alerts load failed: '+e);
+    });
+  }
+
+  // Audio toggle
+  soundSwitch.addEventListener('click', ()=>{
+    SOUND_ON = !SOUND_ON;
+    soundSwitch.classList.toggle('on', SOUND_ON);
+    soundSwitch.setAttribute('aria-checked', SOUND_ON?'true':'false');
+  });
+
+  // Hook playback timeupdate to fire alerts
+  let lastPlayhead = 0;
   outputVideo.addEventListener('timeupdate', ()=>{
-    if(!EVENTS || EVENTS.length===0) return;
     const t = outputVideo.currentTime || 0;
-    while(EV_IDX < EVENTS.length && EVENTS[EV_IDX].t <= t + EPS){
-      const ev = EVENTS[EV_IDX++];
-      const msg = (ev && ev.message) ? ev.message : (ev.level==='danger'?'Danger':'Be careful');
-      // log ra UI
-      appendLog('[ALERT] t='+(ev.t||0).toFixed(2)+' '+(ev.level||'warn')+' -> '+msg);
-      // phát âm thanh nếu bật
+    // replay/seek backward -> reset index
+    if(t + 0.05 < lastPlayhead){ nextIdx = 0; }
+    lastPlayhead = t;
+
+    while(nextIdx < schedule.length && t >= (schedule[nextIdx].t || 0)){
+      const ev = schedule[nextIdx++];
+      const msg = (ev.message || (ev.level==='red'?'Danger':'Be careful'));
+      logLine(`[ALERT] ${t.toFixed(2)}s ${msg}`);
       if(SOUND_ON){
         try{
-          if(ev.level==='danger'){ dangerAudio.currentTime=0; dangerAudio.play().catch(()=>{}); }
-          else if(ev.level==='warn'){ warnAudio.currentTime=0; warnAudio.play().catch(()=>{}); }
-        }catch(e){}
+          if((ev.level||'').toLowerCase()==='red'){ audioRed.currentTime=0; audioRed.play().catch(()=>{}); }
+          else { audioYellow.currentTime=0; audioYellow.play().catch(()=>{}); }
+        }catch(_){}
       }
     }
   });
 
-  // Khi tua: reposition chỉ số EV_IDX tới event đầu >= currentTime - EPS
-  function resetEventCursorTo(t){
-    if(!EVENTS || EVENTS.length===0){ EV_IDX=0; return; }
-    let i=0;
-    while(i<EVENTS.length && EVENTS[i].t < t - EPS) i++;
-    EV_IDX=i;
-  }
-  outputVideo.addEventListener('seeked', ()=>{ resetEventCursorTo(outputVideo.currentTime||0); });
+  // Output controls
+  document.getElementById('playBtn').addEventListener('click', ()=>{ outputVideo.play().catch(()=>{}); });
+  document.getElementById('pauseBtn').addEventListener('click', ()=>{ try{ outputVideo.pause(); }catch(e){} });
+  document.getElementById('bigPlay').addEventListener('click', ()=>{ outputVideo.play().catch(()=>{}); });
+  outputVideo.addEventListener('error', ()=>{
+    logLine('[UI] video element error');
+    if(CURRENT_SRC && WEB_URL && CURRENT_SRC!==WEB_URL){ attachOutput(WEB_URL); return; }
+    if(CURRENT_SRC && OUTPUT_URL && CURRENT_SRC!==OUTPUT_URL){ attachOutput(OUTPUT_URL); return; }
+  });
+
+  // SSE logs (read-only)
+  try{ const es=new EventSource('/logs'); es.onmessage=(e)=>{ const line=e.data; const node=document.createElement('div'); node.textContent=line; logbox.appendChild(node); logbox.scrollTop=logbox.scrollHeight; }; }catch(e){ console.warn('SSE failed',e); }
 </script>
 </body>
 </html>
@@ -565,4 +593,4 @@ INDEX_HTML = r"""
 
 if __name__ == "__main__":
     print("Starting FULLUS UI on http://127.0.0.1:8888")
-    app.run(host="127.0.0.1", port=8888, debug=False, threaded=True)
+    app.run(host="127.0.0.1", port = 8888, debug = False, threaded = True)
