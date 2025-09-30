@@ -3,7 +3,7 @@ import torch
 from ultralytics import YOLO
 
 class YOLODetector:
-    def __init__(self, weights: str, conf=0.25, iou=0.5, half=False, whitelist=None, device="cuda", imgsz=None):
+    def __init__(self, weights: str, conf = 0.25, iou = 0.5, half = False, whitelist = None, device = "cuda", imgsz = None):
         self.device = device if torch.cuda.is_available() else "cpu"
         self.model = YOLO(weights)
         self.model.to(self.device)
@@ -15,33 +15,25 @@ class YOLODetector:
 
         self.conf = float(conf)
         self.iou = float(iou)
-        self.half = False  # giữ FP32 ổn định
+        self.half = False
         self.imgsz = imgsz
 
         self._whitelist_tensor = (
-            torch.as_tensor(sorted(set(int(x) for x in whitelist)), device=self.device, dtype=torch.int64)
+            torch.as_tensor(sorted(set(int(class_name) for class_name in whitelist)), device = self.device, dtype = torch.int64)
             if whitelist is not None else None
         )
 
-        # warm-up để ổn định latency khung đầu
-        H, W = 384, 640
+        height, width = 384, 640
         if isinstance(self.imgsz, (tuple, list)) and len(self.imgsz) == 2:
-            W, H = int(self.imgsz[0]), int(self.imgsz[1])
-        dummy = np.zeros((H, W, 3), dtype="uint8")
+            width, height = int(self.imgsz[0]), int(self.imgsz[1])
+        dummy = np.zeros((height, width, 3), dtype = "uint8")
         with torch.inference_mode():
-            _ = self.model.predict(source=dummy, verbose=False, imgsz=(W, H),
-                                   conf=self.conf, iou=self.iou, device=self.device,
-                                   half=False, stream=False)
+            _ = self.model.predict(source = dummy, verbose = False, imgsz = (width, height), conf = self.conf, iou = self.iou, device = self.device, half = False, stream = False)
 
     @torch.inference_mode()
-    def __call__(self, rgb, img_size=None):
+    def __call__(self, rgb, img_size = None):
         imgsz = img_size if img_size is not None else self.imgsz
-        pred = self.model.predict(
-            source=rgb, verbose=False, imgsz=imgsz,
-            conf=self.conf, iou=self.iou, device=self.device,
-            half=False, stream=False
-        )[0]
-
+        pred = self.model.predict(source = rgb, verbose = False, imgsz = imgsz, conf = self.conf, iou = self.iou, device = self.device, half = False, stream = False)[0]
         boxes = pred.boxes
         xyxy = boxes.xyxy
         conf = boxes.conf
@@ -53,8 +45,9 @@ class YOLODetector:
             conf = conf[keep]
             cls  = cls[keep]
 
-        H, W = rgb.shape[:2]
-        return xyxy, conf, cls, (W, H)
+        height, width = rgb.shape[:2]
+        names = self.names
+        return xyxy, conf, cls, names
 
     @property
     def names(self):

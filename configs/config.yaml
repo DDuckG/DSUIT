@@ -219,6 +219,14 @@ fusion:
     gamma: 0.95    # 0.8–0.9 để nén mạnh phần xa
     scale: 0.4     # tính theo công thức ở trên để “neo” đúng mốc gần
 
+  alerts:
+    roi_frac: [0.25, 0.25, 0.5, 0.5]
+    roi_iou_min: 0.10
+    beep_interval_s: 2.0
+    debounce_frames: 2
+    hysteresis_frames: 2
+    log_texts: {warn: "Be careful", danger: "Danger"}
+
 viz:
   thickness: 2
   font_scale: 0.45

@@ -1,11 +1,9 @@
-# src/main.py
 import os, sys, gc
 import numpy as np
 import cv2
 import torch
 
 sys.path.append(os.path.abspath("."))
-
 from src.config import load_config
 from src.io.async_video import AsyncVideoReader, AsyncVideoWriter
 from src.viz.drawer import draw_boxes, draw_hud
@@ -22,16 +20,13 @@ from src.fusion.pole_proposals import detect_poles_from_depth
 from src.fusion.edge_inside import snap_inside_box
 from src.fusion.obs_sliver import prune_obs_slivers
 from src.fusion.depth_utils import distance_from_box
+from src.fusion.alert_scheduler import AlertScheduler
 from src.utils.geom import iou_matrix
 
-# ---------- helpers ----------
 def _normalize_names(names):
-    # trả về list/tuple các tên lớp
     if isinstance(names, (list, tuple)):
         return list(names)
-    # YOLOv5/8 thường là dict {id:name}
     if hasattr(names, "keys"):
-        # map thành list theo thứ tự id
         try:
             maxk = max(int(k) for k in names.keys())
             out = [""] * (maxk + 1)
@@ -41,7 +36,6 @@ def _normalize_names(names):
             return out
         except Exception:
             return [str(names.get(i, i)) for i in range(100)]
-    # fallback
     return []
 
 def _label_from_id(cid, names_list):
@@ -51,13 +45,11 @@ def _label_from_id(cid, names_list):
     return str(cid)
 
 def _match_tracks_to_dets(track_boxes, det_boxes):
-    # trả về index detection tốt nhất cho mỗi track (hoặc -1 nếu không match)
     if track_boxes.shape[0] == 0 or det_boxes.shape[0] == 0:
         return np.full((track_boxes.shape[0],), -1, dtype=np.int32)
     M = iou_matrix(track_boxes.astype(np.float32), det_boxes.astype(np.float32))
     det_assigned = -np.ones((track_boxes.shape[0],), dtype=np.int32)
     used_d = np.zeros((det_boxes.shape[0],), dtype=bool)
-    # greedy theo IoU
     for ti in range(track_boxes.shape[0]):
         di = int(np.argmax(M[ti]))
         if M[ti, di] <= 0.0 or used_d[di]:
@@ -79,6 +71,8 @@ def _warmup_pipeline(det, seg_model, dep, scaler, enh, W, H, y_imgsz):
 
 @torch.inference_mode()
 def process_video(src_path: str, out_path: str, cfg: dict):
+    import json
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.backends.cudnn.benchmark = True
     threads = int(cfg["io"].get("cpu_threads", 0))
@@ -92,7 +86,6 @@ def process_video(src_path: str, out_path: str, cfg: dict):
     outW, outH = cfg["io"]["output_size"]
     writer = AsyncVideoWriter(out_path, cfg["io"]["output_fps"], (outW, outH), queue_size=write_q)
 
-    # Models
     ycfg = cfg["models"]["yolo"]
     det = YOLODetector(
         ycfg["weights"], conf=ycfg["conf"], iou=ycfg["iou"],
@@ -110,7 +103,6 @@ def process_video(src_path: str, out_path: str, cfg: dict):
         input_size=dcfg["input_size"], device=device, fp32=dcfg["fp32"]
     )
 
-    # Fusion helpers
     pf = cfg["fusion"]["plane_fit"]
     scaler = GroundPlaneScaler(
         reader.W, reader.H, cfg["camera"]["fov_deg_h"], cfg["camera"]["principal"],
@@ -128,6 +120,15 @@ def process_video(src_path: str, out_path: str, cfg: dict):
     incfg = cfg["fusion"]["edge_inside"]
     polecfg= cfg["fusion"]["pole"]
 
+    # Alerts config (mặc định đã có trong config.load_config)
+    acfg = cfg["fusion"].get("alerts", {})
+    roi_frac = tuple(acfg.get("roi_frac", [0.25, 0.25, 0.5, 0.5]))
+    roi_iou_min = float(acfg.get("roi_iou_min", 0.10))
+    beep_interval = float(acfg.get("beep_interval_s", 2.0))
+    debounce_frames = int(acfg.get("debounce_frames", 2))
+    hysteresis_frames = int(acfg.get("hysteresis_frames", 2))
+    log_texts = acfg.get("log_texts", {"warn":"Be careful","danger":"Danger"})
+
     # Trackers
     tracker_y = OCSort(max_age=cfg["tracking"]["yolo"]["max_age"], iou_thr=cfg["tracking"]["yolo"]["iou"])
     tracker_o = ObsTracker(
@@ -143,17 +144,35 @@ def process_video(src_path: str, out_path: str, cfg: dict):
     y_imgsz = tuple(ycfg.get("imgsz", (640,384)))
     enh = DepthEnhancer(cfg["fusion"].get("edge_enhance", {"gauss_k":5,"gauss_sigma":1.2}))
     _warmup_pipeline(det, seg_model, dep, scaler, enh, reader.W, reader.H, y_imgsz)
-    print("[READY] Pipeline D warmed up. Start streaming frames...")
+    print("[READY] Pipeline warmed up. Start streaming frames...")
 
     stride = max(1, int(round(reader.fps / float(cfg["io"]["output_fps"]))))
     last_seg = None
     frame_id = 0
+    out_frame_id = -1  # đếm frame đã ghi
     mem_gc_every = int(cfg["io"].get("mem_gc_every", 0))
+    written_frames = 0
+
+    # alert
+    scheduler = AlertScheduler(
+        video_fps=float(cfg["io"]["output_fps"]),
+        image_wh=(reader.W, reader.H),
+        roi_frac=roi_frac,
+        roi_iou_min=roi_iou_min,
+        thr_low_m=float(thr_low),
+        thr_high_m=float(thr_high),
+        beep_interval_s=beep_interval,
+        debounce_frames=debounce_frames,
+        hysteresis_frames=hysteresis_frames,
+        log_texts=log_texts,
+    )
 
     for packet in reader:
         frame_id += 1
         if (frame_id - 1) % stride != 0:
             continue
+
+        out_frame_id += 1
 
         rgb = packet.rgb
         H, W = packet.H, packet.W
@@ -189,8 +208,7 @@ def process_video(src_path: str, out_path: str, cfg: dict):
         else:
             yb = np.zeros((0,4), dtype=np.float32); ys = np.zeros((0,), dtype=np.float32); yc = np.zeros((0,), dtype=np.int32)
 
-        # ==== Tính distance cho YOLO detections để tô màu ====
-        # dùng depth_m (m) + height_m + seg_id và logic trong depth_utils.distance_from_box
+        # ==== Distance cho YOLO detections để tô màu ====
         if yb.shape[0] > 0:
             y_dists = np.empty((yb.shape[0],), dtype=np.float32)
             for i in range(yb.shape[0]):
@@ -215,16 +233,19 @@ def process_video(src_path: str, out_path: str, cfg: dict):
                 scores = np.concatenate([e_scores, p_scores, v_scores], axis=0)
                 dists  = np.concatenate([e_dists, p_dists, v_dists], axis=0)
                 edgeok = np.concatenate([e_edgeok, np.ones((p_boxes.shape[0],), dtype=bool), np.ones((v_boxes.shape[0],), dtype=bool)], axis=0)
+                srcs   = (["edges"]*e_boxes.shape[0]) + (["planar"]*p_boxes.shape[0]) + (["pole"]*v_boxes.shape[0])
             else:
                 boxes  = np.concatenate([e_boxes, p_boxes], axis=0)
                 scores = np.concatenate([e_scores, p_scores], axis=0)
                 dists  = np.concatenate([e_dists, p_dists], axis=0)
                 edgeok = np.concatenate([e_edgeok, np.ones((p_boxes.shape[0],), dtype=bool)], axis=0)
+                srcs   = (["edges"]*e_boxes.shape[0]) + (["planar"]*p_boxes.shape[0])
         else:
             boxes = np.zeros((0,4), dtype=np.float32)
             scores= np.zeros((0,), dtype=np.float32)
             dists = np.zeros((0,), dtype=np.float32)
             edgeok= np.zeros((0,), dtype=bool)
+            srcs  = []
 
         # Prune slivers & YOLO-protect
         yolo_boxes_np = yb if yb.shape[0] > 0 else np.zeros((0,4), dtype=np.float32)
@@ -287,12 +308,17 @@ def process_video(src_path: str, out_path: str, cfg: dict):
         draw_boxes_arr = np.asarray(draw_boxes_arr, dtype=np.float32) if len(draw_boxes_arr) else np.zeros((0,4), dtype=np.float32)
         draw_dists_arr = np.asarray(draw_dists_arr, dtype=np.float32) if len(draw_dists_arr) else np.zeros((0,), dtype=np.float32)
 
+        # === FEED AlertScheduler (tính sự kiện ngoại tuyến) ===
+        scheduler.feed(out_frame_id, draw_boxes_arr, draw_dists_arr, now_src="viz")
+
+        # === Vẽ & ghi frame ===
         vis = draw_boxes(rgb, draw_boxes_arr, labels, draw_dists_arr, thr=(thr_low,thr_high),
                          thickness=cfg["viz"]["thickness"], font_scale=cfg["viz"]["font_scale"])
         hud = [f"OBS:epp={e_boxes.shape[0]} ppp={p_boxes.shape[0]} pole={v_boxes.shape[0]} out={len(obs_tracks)}  YOLO:{yb.shape[0]} trk={len(y_tracks)}  alpha={alpha:.3f}"]
         vis = draw_hud(vis, hud)
         vis = cv2.resize(vis, (outW,outH), interpolation=cv2.INTER_AREA)
         writer.write_rgb(vis)
+        written_frames += 1
 
         if mem_gc_every > 0 and (frame_id % mem_gc_every) == 0:
             if torch.cuda.is_available():
@@ -300,14 +326,9 @@ def process_video(src_path: str, out_path: str, cfg: dict):
             gc.collect()
 
     writer.release(); reader.release()
+    print(f"[PIPE] wrote {written_frames} frames to {out_path}")
 
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--src", required=True)
-    parser.add_argument("--out", required=True)
-    parser.add_argument("--config", default="configs/config.yaml")
-    args = parser.parse_args()
-    cfg = load_config(args.config)
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    process_video(args.src, args.out, cfg)
+    # === Ghi file alerts.json bên cạnh video xuất ===
+    alerts_json = os.path.splitext(out_path)[0] + "_alerts.json"
+    scheduler.finalize(total_frames=(out_frame_id + 1), out_json=alerts_json)
+    print(f"[ALERTS_READY] {alerts_json}")
