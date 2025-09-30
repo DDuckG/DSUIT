@@ -1,0 +1,17 @@
+[
+  {
+    "t": 0.20267790262172283,
+    "level": "red",
+    "message": "Danger"
+  },
+  {
+    "t": 1.1822877652933832,
+    "level": "red",
+    "message": "Danger"
+  },
+  {
+    "t": 2.2294569288389514,
+    "level": "yellow",
+    "message": "Be careful"
+  }
+]

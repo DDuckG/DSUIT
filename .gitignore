@@ -1,8 +1,5 @@
-data/clean_videos/*
-data/raw_videos/*
 **/__pycache__/
 models/video_depth_anything/checkpoints/video_depth_anything_vits.pth
-outputs
 models/bisenet_v2/weights/*
 .vscode/
 runtime_configs/
