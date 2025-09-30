@@ -4,3 +4,4 @@ data/raw_videos/*
 models/video_depth_anything/checkpoints/video_depth_anything_vits.pth
 outputs
 models/bisenet_v2/weights/*
+.vscode/
